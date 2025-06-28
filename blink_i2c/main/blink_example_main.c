@@ -329,10 +329,10 @@ void app_main(void)
     
     // 选择运行模式：
     // 1. 音频回环（麦克风到扬声器）
-    // xTaskCreate(audio_loopback_task, "audio_loopback", 4096, NULL, 5, NULL);
+    xTaskCreate(audio_loopback_task, "audio_loopback", 4096, NULL, 5, NULL);
     
     // 2. 播放测试音调
-    xTaskCreate(play_test_tone_task, "play_test_tone", 4096, NULL, 5, NULL);
+    // xTaskCreate(play_test_tone_task, "play_test_tone", 4096, NULL, 5, NULL);
     
     ESP_LOGI(TAG, "Audio system initialized and running");
 }
