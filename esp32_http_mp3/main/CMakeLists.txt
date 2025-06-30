@@ -1,3 +1,5 @@
+# esp32_audio/main/CMakeLists.txt
+
 idf_component_register(
     SRCS "es8311_example.c"
     INCLUDE_DIRS "."
@@ -10,6 +12,5 @@ idf_component_register(
         esp_http_client
         spiffs
         nvs_flash
-        esp_adf
         fatfs
 )

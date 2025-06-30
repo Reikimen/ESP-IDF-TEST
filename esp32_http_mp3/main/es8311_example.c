@@ -1,3 +1,4 @@
+// main/es8311_example.c - 简化版本，不依赖ESP-ADF
 #include <stdio.h>
 #include <string.h>
 #include <math.h>
@@ -16,7 +17,6 @@
 #include "esp_http_client.h"
 #include "esp_spiffs.h"
 #include "nvs_flash.h"
-#include "mp3_decoder.h"  // ESP-ADF component
 
 /* WiFi配置 */
 #define WIFI_SSID "CE-Hub-Student"
@@ -24,14 +24,14 @@
 #define WIFI_CONNECTED_BIT BIT0
 #define WIFI_FAIL_BIT      BIT1
 
-/* TTS服务器配置 */
-#define TTS_SERVER_HOST    "192.168.1.100"  // 替换为您的Docker主机IP
+/* TTS服务器配置 - 修改为您的Docker主机IP */
+#define TTS_SERVER_HOST    "192.168.1.100"  // 替换为您的实际IP
 #define TTS_SERVER_PORT    "8001"
 #define TTS_SERVER_URL     "http://" TTS_SERVER_HOST ":" TTS_SERVER_PORT
 
 /* GPIO定义 */
-#define CODEC_ENABLE_PIN    GPIO_NUM_6
-#define PA_CTRL_PIN         GPIO_NUM_40
+#define CODEC_ENABLE_PIN    GPIO_NUM_6   // PREP_VCC_CTL - ES8311 power enable
+#define PA_CTRL_PIN         GPIO_NUM_40  // Power amplifier control pin
 #define I2C_MASTER_SCL_IO   GPIO_NUM_1
 #define I2C_MASTER_SDA_IO   GPIO_NUM_2
 #define I2C_MASTER_NUM      I2C_NUM_0
@@ -53,7 +53,7 @@
 #define SPIFFS_MOUNT_POINT  "/spiffs"
 #define MAX_FILE_SIZE       (1024 * 1024 * 2)  // 2MB最大文件大小
 
-static const char *TAG = "ESP32_TTS_AUDIO";
+static const char *TAG = "ESP32_TTS";
 static EventGroupHandle_t s_wifi_event_group;
 static i2s_chan_handle_t tx_handle = NULL;
 static es8311_handle_t codec_handle = NULL;
@@ -184,7 +184,9 @@ static esp_err_t http_download_event_handler(esp_http_client_event_t *evt) {
                 ctx->downloaded += written;
                 if (ctx->total_size > 0) {
                     int progress = (ctx->downloaded * 100) / ctx->total_size;
-                    ESP_LOGI(TAG, "下载进度: %d%%", progress);
+                    if (progress % 20 == 0) {  // 每20%打印一次进度
+                        ESP_LOGI(TAG, "下载进度: %d%%", progress);
+                    }
                 }
             }
             break;
@@ -194,8 +196,8 @@ static esp_err_t http_download_event_handler(esp_http_client_event_t *evt) {
     return ESP_OK;
 }
 
-/* 下载MP3文件 */
-static esp_err_t download_mp3_file(const char *url, const char *local_path) {
+/* 下载音频文件 */
+static esp_err_t download_audio_file(const char *url, const char *local_path) {
     ESP_LOGI(TAG, "开始下载: %s 到 %s", url, local_path);
     
     FILE *fp = fopen(local_path, "wb");
@@ -338,69 +340,46 @@ static esp_err_t i2s_init_enhanced(i2s_chan_handle_t *tx_handle) {
     return ESP_OK;
 }
 
-/* 播放MP3文件 */
-static esp_err_t play_mp3_file(const char *file_path) {
-    ESP_LOGI(TAG, "开始播放MP3文件: %s", file_path);
+/* 简化的音频播放函数 - 播放测试音调 */
+static esp_err_t play_test_tone(void) {
+    ESP_LOGI(TAG, "播放测试音调");
     
-    FILE *fp = fopen(file_path, "rb");
-    if (!fp) {
-        ESP_LOGE(TAG, "无法打开文件: %s", file_path);
-        return ESP_FAIL;
-    }
+    const int tone_freq = 1000;  // 1kHz测试音调
+    const int duration_ms = 3000; // 3秒
+    const int sample_count = (SAMPLE_RATE * duration_ms) / 1000;
     
-    // 获取文件大小
-    fseek(fp, 0, SEEK_END);
-    size_t file_size = ftell(fp);
-    fseek(fp, 0, SEEK_SET);
-    ESP_LOGI(TAG, "MP3文件大小: %d 字节", file_size);
-    
-    // 初始化MP3解码器
-    mp3_decoder_cfg_t mp3_cfg = DEFAULT_MP3_DECODER_CONFIG();
-    audio_element_handle_t mp3_decoder = mp3_decoder_init(&mp3_cfg);
-    
-    if (!mp3_decoder) {
-        ESP_LOGE(TAG, "MP3解码器初始化失败");
-        fclose(fp);
-        return ESP_FAIL;
-    }
-    
-    // 读取和播放循环
-    uint8_t *read_buffer = malloc(2048);
-    int16_t *pcm_buffer = malloc(4096);
-    size_t bytes_read, bytes_written;
-    
-    if (!read_buffer || !pcm_buffer) {
+    int16_t *audio_buffer = malloc(DMA_BUF_LEN * 2 * sizeof(int16_t));
+    if (!audio_buffer) {
         ESP_LOGE(TAG, "内存分配失败");
-        free(read_buffer);
-        free(pcm_buffer);
-        fclose(fp);
         return ESP_FAIL;
     }
     
-    ESP_LOGI(TAG, "开始解码和播放...");
+    ESP_LOGI(TAG, "开始播放 %dHz 测试音调，持续 %d 秒", tone_freq, duration_ms/1000);
     
-    while (!feof(fp)) {
-        bytes_read = fread(read_buffer, 1, 2048, fp);
-        if (bytes_read > 0) {
-            // 这里应该使用ESP-ADF的MP3解码器API
-            // 由于代码复杂度，这里提供简化版本
-            // 实际实现需要使用ESP-ADF的audio_element系列API
-            
-            // 模拟PCM数据写入I2S
-            esp_err_t ret = i2s_channel_write(tx_handle, read_buffer, bytes_read, &bytes_written, pdMS_TO_TICKS(1000));
-            if (ret != ESP_OK) {
-                ESP_LOGE(TAG, "I2S写入失败: %s", esp_err_to_name(ret));
-                break;
-            }
+    for (int i = 0; i < sample_count; i += DMA_BUF_LEN) {
+        int samples_to_generate = (sample_count - i) > DMA_BUF_LEN ? DMA_BUF_LEN : (sample_count - i);
+        
+        // 生成正弦波测试音调
+        for (int j = 0; j < samples_to_generate; j++) {
+            float sample = 8000 * sinf(2.0f * M_PI * tone_freq * (i + j) / SAMPLE_RATE);
+            audio_buffer[j * 2] = (int16_t)sample;      // Left channel
+            audio_buffer[j * 2 + 1] = (int16_t)sample;  // Right channel
         }
+        
+        size_t bytes_written;
+        esp_err_t ret = i2s_channel_write(tx_handle, audio_buffer, 
+                                         samples_to_generate * 2 * sizeof(int16_t), 
+                                         &bytes_written, pdMS_TO_TICKS(1000));
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "I2S写入失败: %s", esp_err_to_name(ret));
+            break;
+        }
+        
         vTaskDelay(pdMS_TO_TICKS(10));
     }
     
-    free(read_buffer);
-    free(pcm_buffer);
-    fclose(fp);
-    
-    ESP_LOGI(TAG, "MP3播放完成");
+    free(audio_buffer);
+    ESP_LOGI(TAG, "测试音调播放完成");
     return ESP_OK;
 }
 
@@ -416,7 +395,7 @@ static void tts_request_and_play_task(void *pvParameters) {
     snprintf(local_path, sizeof(local_path), "%s/%s", SPIFFS_MOUNT_POINT, filename);
     
     // 构建TTS请求URL
-    snprintf(url, sizeof(url), "%s/synthesize", TTS_SERVER_URL);
+    snprintf(url, sizeof(url), "%s/esp32/tts", TTS_SERVER_URL);
     
     ESP_LOGI(TAG, "请求TTS合成: %s", text);
     
@@ -435,7 +414,7 @@ static void tts_request_and_play_task(void *pvParameters) {
     // 构建JSON请求体
     char json_data[1024];
     snprintf(json_data, sizeof(json_data), 
-             "{\"text\":\"%s\",\"voice\":\"en-US-AriaNeural\",\"format\":\"mp3\"}", text);
+             "{\"text\":\"%s\",\"device_id\":\"esp32_main\"}", text);
     
     esp_http_client_set_post_field(client, json_data, strlen(json_data));
     
@@ -448,46 +427,47 @@ static void tts_request_and_play_task(void *pvParameters) {
         ESP_LOGI(TAG, "TTS请求完成，状态码: %d, 内容长度: %d", status_code, content_length);
         
         if (status_code == 200) {
-            // 解析响应获取音频文件URL
+            // 读取响应
             char response[1024];
             int data_read = esp_http_client_read_response(client, response, sizeof(response)-1);
             response[data_read] = '\0';
             
             ESP_LOGI(TAG, "TTS响应: %s", response);
             
-            // 简化版本：假设响应包含文件名
-            // 实际需要解析JSON获取audio_path
-            char audio_filename[128];
-            if (strstr(response, "audio_path")) {
-                // 解析JSON获取文件名（这里简化处理）
-                sscanf(response, "%*[^\"]\"%*[^\"]\"%*[^\"]\"%[^\"]\"", audio_filename);
-                
-                // 构建下载URL
-                char download_url[512];
-                char *filename_only = strrchr(audio_filename, '/');
-                if (filename_only) {
-                    filename_only++; // 跳过'/'
-                } else {
-                    filename_only = audio_filename;
-                }
-                
-                snprintf(download_url, sizeof(download_url), "%s/audio/%s", TTS_SERVER_URL, filename_only);
-                
-                ESP_LOGI(TAG, "开始下载音频文件: %s", download_url);
-                
-                // 下载MP3文件
-                if (download_mp3_file(download_url, local_path) == ESP_OK) {
-                    // 播放MP3文件
-                    play_mp3_file(local_path);
-                    
-                    // 播放完成后删除文件
-                    if (unlink(local_path) == 0) {
-                        ESP_LOGI(TAG, "临时文件已删除: %s", local_path);
-                    } else {
-                        ESP_LOGE(TAG, "删除临时文件失败: %s", local_path);
+            // 简化的JSON解析 - 提取filename
+            char *filename_start = strstr(response, "\"filename\":\"");
+            if (filename_start) {
+                filename_start += 12;  // 跳过 "filename":"
+                char *filename_end = strchr(filename_start, '"');
+                if (filename_end) {
+                    size_t len = filename_end - filename_start;
+                    if (len < sizeof(filename)) {
+                        strncpy(filename, filename_start, len);
+                        filename[len] = '\0';
+                        
+                        // 构建下载URL
+                        char download_url[512];
+                        snprintf(download_url, sizeof(download_url), "%s/esp32/download/%s", TTS_SERVER_URL, filename);
+                        
+                        ESP_LOGI(TAG, "开始下载音频文件: %s", download_url);
+                        
+                        // 下载音频文件
+                        if (download_audio_file(download_url, local_path) == ESP_OK) {
+                            ESP_LOGI(TAG, "音频下载成功！由于暂未实现MP3解码，播放测试音调代替");
+                            
+                            // 播放测试音调代替MP3播放
+                            play_test_tone();
+                            
+                            // 删除下载的文件
+                            if (unlink(local_path) == 0) {
+                                ESP_LOGI(TAG, "临时文件已删除: %s", filename);
+                            } else {
+                                ESP_LOGE(TAG, "删除临时文件失败: %s", local_path);
+                            }
+                        } else {
+                            ESP_LOGE(TAG, "下载音频文件失败");
+                        }
                     }
-                } else {
-                    ESP_LOGE(TAG, "下载音频文件失败");
                 }
             }
         }
@@ -529,7 +509,7 @@ esp_err_t tts_speak(const char *text) {
 }
 
 void app_main(void) {
-    ESP_LOGI(TAG, "ESP32 TTS音频系统启动");
+    ESP_LOGI(TAG, "ESP32 TTS音频系统启动 - 简化版本");
     
     // 初始化NVS
     esp_err_t ret = nvs_flash_init();
@@ -557,16 +537,29 @@ void app_main(void) {
     
     ESP_LOGI(TAG, "系统初始化完成，可以开始TTS播放");
     
-    // 测试TTS播放
+    // 等待系统稳定
     vTaskDelay(pdMS_TO_TICKS(2000));
-    tts_speak("Hello, this is a test message from ESP32 TTS system.");
+    
+    // 播放启动音调
+    ESP_LOGI(TAG, "播放系统启动提示音");
+    play_test_tone();
+    
+    // 测试TTS功能
+    vTaskDelay(pdMS_TO_TICKS(2000));
+    ESP_LOGI(TAG, "开始TTS测试");
+    tts_speak("Hello, this is ESP32 TTS system test. System is ready for operation.");
     
     // 主循环
     while (1) {
-        // 可以在这里添加按键检测或其他控制逻辑
-        // 例如：检测GPIO按键来触发TTS播放
+        vTaskDelay(pdMS_TO_TICKS(10000));
+        ESP_LOGI(TAG, "系统运行中... 内存剩余: %d KB", esp_get_free_heap_size() / 1024);
         
-        vTaskDelay(pdMS_TO_TICKS(1000));
-        ESP_LOGI(TAG, "系统运行中...");
+        // 定期测试TTS
+        static int test_count = 0;
+        if (++test_count % 6 == 0) {  // 每60秒测试一次
+            char test_message[100];
+            snprintf(test_message, sizeof(test_message), "Test message number %d", test_count / 6);
+            tts_speak(test_message);
+        }
     }
 }
