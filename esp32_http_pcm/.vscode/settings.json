@@ -6,7 +6,7 @@
   "idf.openOcdConfigs": [
     "board/esp32s3-builtin.cfg"
   ],
-  "idf.port": "/dev/tty.usbmodem31101",
+  "idf.port": "/dev/tty.usbmodem31201",
   "idf.toolsPath": "/Users/dankao/.espressif",
   "idf.customExtraVars": {
     "IDF_TARGET": "esp32s3"
