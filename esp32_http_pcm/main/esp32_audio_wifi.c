@@ -38,7 +38,7 @@
 #define WIFI_MAXIMUM_RETRY     5
 
 /* HTTP Configuration */
-#define TTS_SERVER_IP          "10.129.119.150"  // Update with your server IP (same network as ESP32)
+#define TTS_SERVER_IP          "10.129.113.191"  // Update with your server IP (same network as ESP32)
 #define TTS_SERVER_PORT        8001
 #define TTS_SERVER_URL         "http://" TTS_SERVER_IP ":8001"
 
