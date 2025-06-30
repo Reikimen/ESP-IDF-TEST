@@ -391,7 +391,7 @@ static void tts_request_and_play_task(void *pvParameters) {
     char local_path[128];
     
     // 生成唯一文件名
-    snprintf(filename, sizeof(filename), "tts_%ld.mp3", time(NULL));
+    snprintf(filename, sizeof(filename), "tts_%lld.mp3", time(NULL));
     snprintf(local_path, sizeof(local_path), "%s/%s", SPIFFS_MOUNT_POINT, filename);
     
     // 构建TTS请求URL

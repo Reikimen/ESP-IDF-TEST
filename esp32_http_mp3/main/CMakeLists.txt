@@ -12,5 +12,6 @@ idf_component_register(
         esp_http_client
         spiffs
         nvs_flash
+        esp_adf
         fatfs
 )
