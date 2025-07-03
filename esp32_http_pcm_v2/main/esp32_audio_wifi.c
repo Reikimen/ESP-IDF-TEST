@@ -68,9 +68,9 @@
 #define DMA_BUF_COUNT          8
 
 /* Audio buffer configuration */
-#define MAX_AUDIO_SIZE         (256 * 1024)  // 128KB最大音频文件大小
-#define DOWNLOAD_CHUNK_SIZE    (4 * 1024)    // 4KB下载块大小
-#define POLL_INTERVAL_MS       2000          // 轮询间隔
+#define MAX_AUDIO_SIZE         (1024 * 1024)
+#define DOWNLOAD_CHUNK_SIZE    (16 * 1024)
+#define POLL_INTERVAL_MS       2000       
 
 static const char *TAG = "ESP32_POLLING_AUDIO";
 static EventGroupHandle_t s_wifi_event_group;
