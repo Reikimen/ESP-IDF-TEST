@@ -1,63 +1,52 @@
-/**
- * ESP32 Polling-based TTS Audio Player with PSRAM Support
- * 基于轮询的TTS音频播放系统 - 支持PSRAM大文件处理
- * ESP32-S3-WROOM-1-N16R8 (16MB Flash + 8MB PSRAM)
+/* ESP32 HTTP PCM Audio Player with WiFi - PSRAM Optimized Version
+ * This version uses PSRAM for large audio buffer storage
  */
 
-#include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
-#include <ctype.h>
-#include <sys/unistd.h>
-#include <sys/stat.h>
-
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
-#include "freertos/ringbuf.h"
-
-#include "esp_log.h"
-#include "esp_err.h"
 #include "esp_system.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
-#include "esp_http_client.h"
-#include "esp_heap_caps.h"
-#include "esp_psram.h"
-
+#include "esp_log.h"
 #include "nvs_flash.h"
-#include "driver/i2c.h"
 #include "driver/i2s_std.h"
+#include "driver/i2c.h"
 #include "driver/gpio.h"
-
 #include "es8311.h"
+#include "esp_http_client.h"
+#include "esp_psram.h"
+#include "esp_heap_caps.h"
+#include "lwip/err.h"
+#include "lwip/sys.h"
+
+/* Network Configuration */
+#define TTS_SERVER_URL         "http://192.168.31.115:3031"
+#define DEVICE_ID              "ESP32_VOICE_01"
 
 /* WiFi Configuration */
 #define WIFI_SSID              "CE-Hub-Student"
 #define WIFI_PASSWORD          "casa-ce-gagarin-public-service"
+#define WIFI_MAXIMUM_RETRY     10
+
+/* FreeRTOS event group */
 #define WIFI_CONNECTED_BIT     BIT0
 #define WIFI_FAIL_BIT          BIT1
-#define WIFI_MAXIMUM_RETRY     5
 
-/* HTTP Configuration */
-#define TTS_SERVER_IP          "10.129.113.191"  
-#define TTS_SERVER_PORT        8001
-#define TTS_SERVER_URL         "http://" TTS_SERVER_IP ":8001"
-#define DEVICE_ID              "ESP32_VOICE_01"
-
-/* Audio Hardware Configuration - 保持原有引脚设置 */
-#define CODEC_ENABLE_PIN       GPIO_NUM_6   // PREP_VCC_CTL - ES8311 power enable
-#define PA_CTRL_PIN            GPIO_NUM_40  // Power amplifier control pin
-
-/* I2C Configuration */
-#define I2C_MASTER_NUM         I2C_NUM_0
+/* I2C Configuration for ES8311 */
 #define I2C_MASTER_SCL_IO      GPIO_NUM_1  
-#define I2C_MASTER_SDA_IO      GPIO_NUM_2   
+#define I2C_MASTER_SDA_IO      GPIO_NUM_2  
+#define I2C_MASTER_NUM         0
 #define I2C_MASTER_FREQ_HZ     50000
-#define ES8311_I2C_ADDR        0x18
+#define I2C_MASTER_TIMEOUT_MS  1000
+
+/* ES8311 Configuration */
+#define ES8311_ADDR            0x18
+#define CODEC_ENABLE_PIN       GPIO_NUM_6
+#define PA_CTRL_PIN            GPIO_NUM_40
 
 /* I2S Configuration */
-#define I2S_NUM                I2S_NUM_0
 #define I2S_BCK_IO             GPIO_NUM_16  
 #define I2S_WS_IO              GPIO_NUM_17  
 #define I2S_DO_IO              GPIO_NUM_18  
@@ -108,20 +97,21 @@ typedef struct {
 static void* audio_malloc(size_t size) {
     void *ptr = NULL;
     
-    // 对于大于32KB的分配，尝试使用PSRAM
-    if (size > 32 * 1024 && esp_psram_is_initialized()) {
-        ptr = heap_caps_malloc(size, MALLOC_CAP_SPIRAM);
+    // 对于大于16KB的分配，优先使用PSRAM
+    if (size > 16 * 1024 && esp_psram_is_initialized()) {
+        ptr = heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
         if (ptr) {
             ESP_LOGI(TAG, "Allocated %d bytes from PSRAM", size);
+            return ptr;
         }
     }
     
-    // 如果PSRAM分配失败或大小较小，使用内部RAM
-    if (!ptr) {
-        ptr = heap_caps_malloc(size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-        if (ptr) {
-            ESP_LOGI(TAG, "Allocated %d bytes from internal RAM", size);
-        }
+    // 否则使用内部RAM
+    ptr = heap_caps_malloc(size, MALLOC_CAP_DEFAULT);
+    if (ptr) {
+        ESP_LOGI(TAG, "Allocated %d bytes from internal RAM", size);
+    } else {
+        ESP_LOGE(TAG, "Failed to allocate %d bytes", size);
     }
     
     return ptr;
@@ -134,7 +124,7 @@ static void* audio_realloc(void *ptr, size_t size) {
     }
     
     // 对于大内存，尝试在PSRAM中重新分配
-    if (size > 32 * 1024 && esp_psram_is_initialized()) {
+    if (size > 16 * 1024 && esp_psram_is_initialized()) {
         void *new_ptr = heap_caps_realloc(ptr, size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
         if (new_ptr) {
             ESP_LOGD(TAG, "Reallocated %d bytes in PSRAM", size);
@@ -143,7 +133,7 @@ static void* audio_realloc(void *ptr, size_t size) {
     }
     
     // 否则使用内部RAM
-    void *new_ptr = heap_caps_realloc(ptr, size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    void *new_ptr = heap_caps_realloc(ptr, size, MALLOC_CAP_DEFAULT);
     if (new_ptr) {
         ESP_LOGD(TAG, "Reallocated %d bytes in internal RAM", size);
     }
@@ -172,7 +162,7 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
     }
 }
 
-/* 初始化WiFi */
+/* WiFi初始化 */
 static esp_err_t wifi_init_sta(void) {
     s_wifi_event_group = xEventGroupCreate();
 
@@ -201,14 +191,13 @@ static esp_err_t wifi_init_sta(void) {
             .ssid = WIFI_SSID,
             .password = WIFI_PASSWORD,
             .threshold.authmode = WIFI_AUTH_WPA2_PSK,
-            .sae_pwe_h2e = WPA3_SAE_PWE_BOTH,
         },
     };
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
 
-    ESP_LOGI(TAG, "wifi_init_sta finished.");
+    ESP_LOGI(TAG, "WiFi init finished.");
 
     EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group,
             WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
@@ -233,20 +222,39 @@ static esp_err_t download_event_handler(esp_http_client_event_t *evt) {
     download_state_t *download_state = (download_state_t *)evt->user_data;
     
     switch(evt->event_id) {
+        case HTTP_EVENT_ERROR:
+            ESP_LOGD(TAG, "HTTP_EVENT_ERROR");
+            break;
+            
+        case HTTP_EVENT_ON_CONNECTED:
+            ESP_LOGD(TAG, "HTTP_EVENT_ON_CONNECTED");
+            download_state->size = 0;
+            break;
+            
+        case HTTP_EVENT_HEADER_SENT:
+            ESP_LOGD(TAG, "HTTP_EVENT_HEADER_SENT");
+            break;
+            
+        case HTTP_EVENT_ON_HEADER:
+            ESP_LOGD(TAG, "HTTP_EVENT_ON_HEADER, key=%s, value=%s", evt->header_key, evt->header_value);
+            break;
+            
         case HTTP_EVENT_ON_DATA:
             if (!esp_http_client_is_chunked_response(evt->client)) {
-                // 动态扩展缓冲区如果需要
-                if (download_state->size + evt->data_len > download_state->capacity) {
-                    size_t new_capacity = download_state->capacity + DOWNLOAD_CHUNK_SIZE;
+                // 检查是否需要扩展缓冲区
+                while (download_state->size + evt->data_len > download_state->capacity) {
+                    size_t new_capacity = download_state->capacity * 2;  // 2倍扩展
                     
                     // 检查是否超过最大限制
                     if (new_capacity > MAX_AUDIO_SIZE) {
-                        ESP_LOGW(TAG, "Audio file too large (>%d bytes), truncating", MAX_AUDIO_SIZE);
-                        evt->data_len = MAX_AUDIO_SIZE - download_state->size;
-                        if (evt->data_len <= 0) {
-                            return ESP_OK;
-                        }
                         new_capacity = MAX_AUDIO_SIZE;
+                        if (download_state->size + evt->data_len > new_capacity) {
+                            ESP_LOGW(TAG, "Audio file too large (>%d bytes), truncating", MAX_AUDIO_SIZE);
+                            evt->data_len = new_capacity - download_state->size;
+                            if (evt->data_len <= 0) {
+                                return ESP_OK;
+                            }
+                        }
                     }
                     
                     // 使用优化的重分配函数
@@ -255,7 +263,6 @@ static esp_err_t download_event_handler(esp_http_client_event_t *evt) {
                         ESP_LOGE(TAG, "Failed to reallocate download buffer");
                         return ESP_FAIL;
                     }
-                    
                     download_state->buffer = new_buffer;
                     download_state->capacity = new_capacity;
                     ESP_LOGD(TAG, "Expanded buffer to %d bytes", new_capacity);
@@ -264,33 +271,17 @@ static esp_err_t download_event_handler(esp_http_client_event_t *evt) {
                 if (evt->data_len > 0) {
                     memcpy(download_state->buffer + download_state->size, evt->data, evt->data_len);
                     download_state->size += evt->data_len;
+                    ESP_LOGD(TAG, "Downloaded %d bytes, total: %d", evt->data_len, download_state->size);
                 }
             }
-            break;
-        
-        case HTTP_EVENT_ON_CONNECTED:
-            ESP_LOGD(TAG, "HTTP connected for download");
-            download_state->size = 0;
             break;
             
-        case HTTP_EVENT_ON_HEADER:
-            // 可以解析Content-Length头来预分配适当大小的缓冲区
-            if (strcasecmp(evt->header_key, "Content-Length") == 0) {
-                size_t content_length = atoi(evt->header_value);
-                ESP_LOGI(TAG, "Content-Length: %d bytes", content_length);
-                
-                // 如果内容长度已知且合理，预分配整个缓冲区
-                if (content_length > 0 && content_length <= MAX_AUDIO_SIZE) {
-                    if (content_length > download_state->capacity) {
-                        uint8_t *new_buffer = audio_realloc(download_state->buffer, content_length);
-                        if (new_buffer) {
-                            download_state->buffer = new_buffer;
-                            download_state->capacity = content_length;
-                            ESP_LOGI(TAG, "Pre-allocated %d bytes for download", content_length);
-                        }
-                    }
-                }
-            }
+        case HTTP_EVENT_ON_FINISH:
+            ESP_LOGD(TAG, "HTTP_EVENT_ON_FINISH");
+            break;
+            
+        case HTTP_EVENT_DISCONNECTED:
+            ESP_LOGD(TAG, "HTTP_EVENT_DISCONNECTED");
             break;
             
         default:
@@ -299,7 +290,7 @@ static esp_err_t download_event_handler(esp_http_client_event_t *evt) {
     return ESP_OK;
 }
 
-/* 轮询新的TTS任务 */
+/* 轮询新的TTS任务 - 增加重试机制 */
 static esp_err_t poll_for_tts_task(char *audio_id, size_t audio_id_size) {
     char poll_buffer[1024];
     download_state_t poll_state = {
@@ -315,6 +306,11 @@ static esp_err_t poll_for_tts_task(char *audio_id, size_t audio_id_size) {
         .timeout_ms = 30000,  // 30秒长轮询
         .event_handler = download_event_handler,
         .user_data = &poll_state,
+        .disable_auto_redirect = true,
+        .keep_alive_enable = true,
+        .keep_alive_idle = 30,
+        .keep_alive_interval = 10,
+        .keep_alive_count = 3,
     };
     
     esp_http_client_handle_t client = esp_http_client_init(&config);
@@ -376,6 +372,27 @@ static esp_err_t poll_for_tts_task(char *audio_id, size_t audio_id_size) {
     return err;
 }
 
+/* 带重试的轮询函数 */
+static esp_err_t poll_for_tts_task_with_retry(char *audio_id, size_t audio_id_size) {
+    esp_err_t err;
+    int retry_count = 0;
+    const int max_retries = 3;
+    
+    while (retry_count < max_retries) {
+        err = poll_for_tts_task(audio_id, audio_id_size);
+        
+        if (err == ESP_OK || err == ESP_ERR_NOT_FOUND) {
+            return err;
+        }
+        
+        retry_count++;
+        ESP_LOGW(TAG, "Poll failed, retry %d/%d", retry_count, max_retries);
+        vTaskDelay(pdMS_TO_TICKS(1000 * retry_count));  // 递增延迟
+    }
+    
+    return err;
+}
+
 /* 下载PCM音频文件 - 使用PSRAM优化 */
 static esp_err_t download_pcm_audio(const char *audio_id) {
     char url[256];
@@ -403,7 +420,7 @@ static esp_err_t download_pcm_audio(const char *audio_id) {
         .buffer = initial_buffer,
         .capacity = INITIAL_BUFFER_SIZE,
         .size = 0,
-        .use_psram = (esp_psram_is_initialized() && INITIAL_BUFFER_SIZE > 32 * 1024)
+        .use_psram = (esp_psram_is_initialized() && INITIAL_BUFFER_SIZE > 16 * 1024)
     };
     
     ESP_LOGI(TAG, "Initial buffer allocated in %s", 
@@ -412,10 +429,13 @@ static esp_err_t download_pcm_audio(const char *audio_id) {
     esp_http_client_config_t config = {
         .url = url,
         .method = HTTP_METHOD_GET,
-        .timeout_ms = 60000,  // 增加超时时间以支持大文件
+        .timeout_ms = 60000,  // 60秒超时
         .event_handler = download_event_handler,
         .user_data = &download_state,
-        .buffer_size = 4096,  // 增加HTTP缓冲区大小
+        .buffer_size = 4096,
+        .disable_auto_redirect = true,
+        .max_redirection_count = 0,
+        .max_authorization_retries = 0,
     };
     
     esp_http_client_handle_t client = esp_http_client_init(&config);
@@ -461,6 +481,27 @@ static esp_err_t download_pcm_audio(const char *audio_id) {
     return err;
 }
 
+/* 带重试的下载函数 */
+static esp_err_t download_pcm_audio_with_retry(const char *audio_id) {
+    esp_err_t err;
+    int retry_count = 0;
+    const int max_retries = 3;
+    
+    while (retry_count < max_retries) {
+        err = download_pcm_audio(audio_id);
+        
+        if (err == ESP_OK) {
+            return err;
+        }
+        
+        retry_count++;
+        ESP_LOGW(TAG, "Download failed, retry %d/%d", retry_count, max_retries);
+        vTaskDelay(pdMS_TO_TICKS(2000 * retry_count));  // 递增延迟
+    }
+    
+    return err;
+}
+
 /* Initialize I2C - same as original */
 static esp_err_t i2c_master_init(void) {
     int i2c_master_port = I2C_MASTER_NUM;
@@ -496,13 +537,13 @@ static esp_err_t es8311_codec_init(es8311_handle_t *codec_handle) {
     ESP_LOGI(TAG, "Power amplifier enabled on GPIO%d", PA_CTRL_PIN);
     
     /* Create ES8311 handle */
-    *codec_handle = es8311_create(I2C_MASTER_NUM, ES8311_I2C_ADDR);
-    if (*codec_handle == NULL) {
+    *codec_handle = es8311_create(I2C_MASTER_NUM, ES8311_ADDR);
+    if (!*codec_handle) {
         ESP_LOGE(TAG, "Failed to create ES8311 handle");
         return ESP_FAIL;
     }
-
-    /* Configure ES8311 clock - using SCLK as MCLK source like original */
+    
+    /* Configure ES8311 clock - using SCLK as MCLK source */
     es8311_clock_config_t clk_cfg = {
         .mclk_inverted = false,
         .sclk_inverted = false,
@@ -533,10 +574,8 @@ static esp_err_t es8311_codec_init(es8311_handle_t *codec_handle) {
 
 /* Initialize I2S */
 static esp_err_t i2s_init(void) {
-    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM, I2S_ROLE_MASTER);
-    chan_cfg.dma_desc_num = DMA_BUF_COUNT;
-    chan_cfg.dma_frame_num = DMA_BUF_LEN;
-    
+    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
+    chan_cfg.auto_clear = true;
     ESP_ERROR_CHECK(i2s_new_channel(&chan_cfg, &tx_handle, &rx_handle));
 
     i2s_std_config_t std_cfg = {
@@ -681,11 +720,11 @@ static void tts_polling_task(void *pvParameters) {
     while (1) {
         // 如果当前没有音频在播放或下载，则轮询新任务
         if (!audio_state.has_audio || (!audio_state.is_playing && audio_state.download_complete)) {
-            esp_err_t err = poll_for_tts_task(audio_id, sizeof(audio_id));
+            esp_err_t err = poll_for_tts_task_with_retry(audio_id, sizeof(audio_id));
             
             if (err == ESP_OK) {
                 // 有新的TTS任务，下载音频
-                err = download_pcm_audio(audio_id);
+                err = download_pcm_audio_with_retry(audio_id);
                 if (err != ESP_OK) {
                     ESP_LOGE(TAG, "Failed to download audio: %s", audio_id);
                 }
