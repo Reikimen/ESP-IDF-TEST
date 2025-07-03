@@ -1,5 +1,5 @@
 /**
- * ES8311 Audio Example with WiFi and HTTP Download
+ * ES8311 Audio Example with WiFi and HTTP Polling
  * ESP32-S3-WROOM-1-N16R8
  * Fixed GPIO configuration based on original esp32_audio project
  */
@@ -38,9 +38,10 @@
 #define WIFI_MAXIMUM_RETRY     5
 
 /* HTTP Configuration */
-#define TTS_SERVER_IP          "10.129.113.191"  // Update with your server IP (same network as ESP32)
+#define TTS_SERVER_IP          "10.129.113.191"  // Update with your server IP
 #define TTS_SERVER_PORT        8001
 #define TTS_SERVER_URL         "http://" TTS_SERVER_IP ":8001"
+#define DEVICE_ID              "ESP32_VOICE_01"  // Unique device ID
 
 /* Audio Hardware Configuration - FROM ORIGINAL PROJECT */
 #define CODEC_ENABLE_PIN       GPIO_NUM_6   // PREP_VCC_CTL - ES8311 power enable
@@ -59,7 +60,6 @@
 #define I2S_WS_IO              GPIO_NUM_17  
 #define I2S_DO_IO              GPIO_NUM_18  
 #define I2S_DI_IO              GPIO_NUM_15  
-// Note: MCLK not used in original project
 
 /* Audio Configuration */
 #define SAMPLE_RATE            48000        // Changed to 48kHz like original
@@ -70,7 +70,7 @@
 /* Ring buffer for audio streaming */
 #define AUDIO_RING_BUF_SIZE    (32 * 1024)  // 32KB ring buffer
 
-static const char *TAG = "ES8311_HTTP";
+static const char *TAG = "ES8311_POLLING";
 static EventGroupHandle_t s_wifi_event_group;
 static int s_retry_num = 0;
 static i2s_chan_handle_t tx_handle = NULL;
@@ -83,9 +83,14 @@ typedef struct {
     bool stream_done;
     size_t total_received;
     size_t total_played;
+    char current_audio_id[64];
 } audio_state_t;
 
 static audio_state_t audio_state = {0};
+
+/* Global buffer for poll response */
+static char poll_response_buffer[1024];
+static int poll_response_len = 0;
 
 /* WiFi event handler */
 static void wifi_event_handler(void* arg, esp_event_base_t event_base,
@@ -109,7 +114,7 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
     }
 }
 
-/* Initialize WiFi */
+/* Initialize WiFi - same as original */
 static esp_err_t wifi_init_sta(void) {
     s_wifi_event_group = xEventGroupCreate();
 
@@ -166,7 +171,108 @@ static esp_err_t wifi_init_sta(void) {
     }
 }
 
-/* HTTP streaming event handler */
+/* Global buffer for poll response */
+static char poll_response_buffer[1024];
+// static int poll_response_len = 0;
+
+/* HTTP event handler for polling */
+static esp_err_t poll_event_handler(esp_http_client_event_t *evt) {
+    switch(evt->event_id) {
+        case HTTP_EVENT_ON_DATA:
+            // Copy data to our buffer
+            if (poll_response_len + evt->data_len < sizeof(poll_response_buffer)) {
+                memcpy(poll_response_buffer + poll_response_len, evt->data, evt->data_len);
+                poll_response_len += evt->data_len;
+            }
+            break;
+        case HTTP_EVENT_ON_CONNECTED:
+            // Reset buffer
+            poll_response_len = 0;
+            memset(poll_response_buffer, 0, sizeof(poll_response_buffer));
+            break;
+        default:
+            break;
+    }
+    return ESP_OK;
+}
+
+/* Poll for new TTS tasks */
+static esp_err_t poll_for_tts_task(char *audio_id, size_t audio_id_size) {
+    esp_http_client_config_t config = {
+        .url = TTS_SERVER_URL "/esp32/poll",
+        .method = HTTP_METHOD_GET,
+        .timeout_ms = 30000,  // 30 seconds timeout for long polling
+        .buffer_size = 1024,
+        .event_handler = poll_event_handler,  // Use event handler to capture response
+    };
+    
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    if (!client) {
+        ESP_LOGE(TAG, "Failed to initialize HTTP client");
+        return ESP_FAIL;
+    }
+    
+    // Set device ID header
+    esp_http_client_set_header(client, "X-Device-ID", DEVICE_ID);
+    
+    ESP_LOGI(TAG, "Polling for new tasks...");
+    
+    // Reset response buffer
+    poll_response_len = 0;
+    memset(poll_response_buffer, 0, sizeof(poll_response_buffer));
+    
+    // Perform the request
+    esp_err_t err = esp_http_client_perform(client);
+    
+    if (err == ESP_OK) {
+        int status_code = esp_http_client_get_status_code(client);
+        
+        ESP_LOGI(TAG, "Poll response: status=%d, response_len=%d", status_code, poll_response_len);
+        
+        if (status_code == 200 && poll_response_len > 0) {
+            ESP_LOGI(TAG, "Response: %s", poll_response_buffer);
+            
+            // Simple JSON parsing to extract audio_id
+            char *audio_id_start = strstr(poll_response_buffer, "\"audio_id\":\"");
+            if (audio_id_start) {
+                audio_id_start += 12;  // Skip to start of audio_id value
+                char *audio_id_end = strchr(audio_id_start, '"');
+                if (audio_id_end) {
+                    size_t id_len = audio_id_end - audio_id_start;
+                    if (id_len < audio_id_size - 1) {
+                        strncpy(audio_id, audio_id_start, id_len);
+                        audio_id[id_len] = '\0';
+                        ESP_LOGI(TAG, "New TTS task available: %s", audio_id);
+                        err = ESP_OK;
+                    } else {
+                        ESP_LOGW(TAG, "Audio ID too long: %d", id_len);
+                        err = ESP_FAIL;
+                    }
+                } else {
+                    ESP_LOGW(TAG, "Failed to find end of audio_id");
+                    err = ESP_FAIL;
+                }
+            } else {
+                ESP_LOGW(TAG, "No audio_id found in response");
+                err = ESP_FAIL;
+            }
+        } else if (status_code == 204) {
+            // No content - no new tasks, this is normal
+            ESP_LOGD(TAG, "No new tasks available (204)");
+            err = ESP_ERR_NOT_FOUND;
+        } else {
+            ESP_LOGW(TAG, "Unexpected response: status=%d", status_code);
+            err = ESP_FAIL;
+        }
+    } else {
+        ESP_LOGE(TAG, "HTTP request failed: %s", esp_err_to_name(err));
+    }
+    
+    esp_http_client_cleanup(client);
+    return err;
+}
+
+/* HTTP streaming event handler for PCM data */
 static esp_err_t http_stream_event_handler(esp_http_client_event_t *evt) {
     switch(evt->event_id) {
         case HTTP_EVENT_ERROR:
@@ -219,45 +325,38 @@ static esp_err_t http_stream_event_handler(esp_http_client_event_t *evt) {
     return ESP_OK;
 }
 
-/* Stream TTS with optimized API */
-static esp_err_t stream_tts_audio(const char* text, const char* voice) {
-    char post_data[512];
+/* Stream audio data for a specific audio_id */
+static esp_err_t stream_audio_pcm(const char *audio_id) {
+    char url[256];
+    snprintf(url, sizeof(url), "%s/audio/%s.pcm", TTS_SERVER_URL, audio_id);
     
-    // Create JSON request body
-    snprintf(post_data, sizeof(post_data), 
-             "{\"text\":\"%s\",\"voice\":\"%s\"}", text, voice);
-    
-    ESP_LOGI(TAG, "Requesting TTS stream for: %s", text);
-    
-    // Configure HTTP client for streaming
-    esp_http_client_config_t config = {
-        .url = TTS_SERVER_URL "/esp32/pcm",
-        .method = HTTP_METHOD_POST,
-        .event_handler = http_stream_event_handler,
-        .timeout_ms = 30000,
-        .buffer_size = 2048,
-        .buffer_size_tx = 2048,
-    };
-    
-    esp_http_client_handle_t client = esp_http_client_init(&config);
-    
-    // Set headers
-    esp_http_client_set_header(client, "Content-Type", "application/json");
-    esp_http_client_set_post_field(client, post_data, strlen(post_data));
+    ESP_LOGI(TAG, "Streaming PCM from: %s", url);
     
     // Reset audio state
     audio_state.is_playing = false;
     audio_state.stream_done = false;
     audio_state.total_received = 0;
     audio_state.total_played = 0;
+    strncpy(audio_state.current_audio_id, audio_id, sizeof(audio_state.current_audio_id) - 1);
     
-    // Clear ring buffer - consume all items
+    // Clear ring buffer
     size_t item_size;
     void *item = xRingbufferReceive(audio_ring_buf, &item_size, 0);
     while (item != NULL) {
         vRingbufferReturnItem(audio_ring_buf, item);
         item = xRingbufferReceive(audio_ring_buf, &item_size, 0);
     }
+    
+    // Configure HTTP client for streaming
+    esp_http_client_config_t config = {
+        .url = url,
+        .method = HTTP_METHOD_GET,
+        .event_handler = http_stream_event_handler,
+        .timeout_ms = 30000,
+        .buffer_size = 2048,
+    };
+    
+    esp_http_client_handle_t client = esp_http_client_init(&config);
     
     // Perform HTTP request (will stream data via event handler)
     esp_err_t err = esp_http_client_perform(client);
@@ -278,68 +377,10 @@ static esp_err_t stream_tts_audio(const char* text, const char* voice) {
     return err;
 }
 
-/* Audio playback task */
-static void audio_playback_task(void *pvParameters) {
-    size_t item_size;
-    int16_t *audio_data;
-    size_t bytes_written;
-    
-    // Allocate a working buffer for I2S (stereo)
-    const size_t i2s_buffer_size = DMA_BUF_LEN * 2 * sizeof(int16_t);  // Stereo
-    int16_t *i2s_buffer = (int16_t *)malloc(i2s_buffer_size);
-    
-    if (!i2s_buffer) {
-        ESP_LOGE(TAG, "Failed to allocate I2S buffer");
-        vTaskDelete(NULL);
-        return;
-    }
-    
-    ESP_LOGI(TAG, "Audio playback task started");
-    
-    while (1) {
-        // Wait for audio data in ring buffer
-        audio_data = (int16_t *)xRingbufferReceive(audio_ring_buf, 
-                                                   &item_size, 
-                                                   pdMS_TO_TICKS(100));
-        
-        if (audio_data != NULL) {
-            // Convert mono to stereo if needed
-            size_t samples = item_size / sizeof(int16_t);
-            for (int i = 0; i < samples && i < DMA_BUF_LEN; i++) {
-                i2s_buffer[i * 2] = audio_data[i];      // Left channel
-                i2s_buffer[i * 2 + 1] = audio_data[i];  // Right channel
-            }
-            
-            // Return item to ring buffer
-            vRingbufferReturnItem(audio_ring_buf, (void *)audio_data);
-            
-            // Write to I2S
-            size_t stereo_size = samples * 2 * sizeof(int16_t);
-            esp_err_t ret = i2s_channel_write(tx_handle, i2s_buffer, stereo_size, 
-                                            &bytes_written, portMAX_DELAY);
-            
-            if (ret != ESP_OK) {
-                ESP_LOGE(TAG, "I2S write failed: %s", esp_err_to_name(ret));
-            } else {
-                audio_state.total_played += bytes_written;
-            }
-            
-        } else if (audio_state.stream_done && audio_state.is_playing) {
-            // No more data and streaming is done
-            ESP_LOGI(TAG, "Playback complete. Played %d bytes", audio_state.total_played);
-            audio_state.is_playing = false;
-            
-            // Small delay before next request
-            vTaskDelay(pdMS_TO_TICKS(500));
-        }
-    }
-    
-    free(i2s_buffer);
-    vTaskDelete(NULL);
-}
-
-/* Initialize I2C */
+/* Initialize I2C - same as original */
 static esp_err_t i2c_master_init(void) {
+    int i2c_master_port = I2C_MASTER_NUM;
+    
     i2c_config_t conf = {
         .mode = I2C_MODE_MASTER,
         .sda_io_num = I2C_MASTER_SDA_IO,
@@ -348,18 +389,16 @@ static esp_err_t i2c_master_init(void) {
         .scl_pullup_en = GPIO_PULLUP_ENABLE,
         .master.clk_speed = I2C_MASTER_FREQ_HZ,
     };
-
-    esp_err_t err = i2c_param_config(I2C_MASTER_NUM, &conf);
-    if (err != ESP_OK) {
-        return err;
-    }
-
-    return i2c_driver_install(I2C_MASTER_NUM, conf.mode, 0, 0, 0);
+    
+    i2c_param_config(i2c_master_port, &conf);
+    
+    return i2c_driver_install(i2c_master_port, conf.mode,
+                            0, 0, 0);
 }
 
-/* Initialize ES8311 codec */
+/* Initialize ES8311 codec - using correct API */
 static esp_err_t es8311_codec_init(es8311_handle_t *codec_handle) {
-    /* CRITICAL: Enable codec power first! */
+    /* Enable codec power */
     gpio_reset_pin(CODEC_ENABLE_PIN);
     gpio_set_direction(CODEC_ENABLE_PIN, GPIO_MODE_OUTPUT);
     gpio_set_level(CODEC_ENABLE_PIN, 1);
@@ -423,7 +462,7 @@ static esp_err_t i2s_init(void) {
         .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(SAMPLE_RATE),
         .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO),
         .gpio_cfg = {
-            .mclk = I2S_GPIO_UNUSED,  // MCLK not connected
+            .mclk = I2S_GPIO_UNUSED,
             .bclk = I2S_BCK_IO,
             .ws = I2S_WS_IO,
             .dout = I2S_DO_IO,
@@ -446,49 +485,121 @@ static esp_err_t i2s_init(void) {
     return ESP_OK;
 }
 
-/* Main TTS request task */
-static void tts_request_task(void *pvParameters) {
-    const char* test_texts[] = {
-        "Hello from ESP32 with streaming audio",
-        "This system uses optimized PCM streaming",
-        "No files are stored on the device",
-        "The audio plays while downloading"
-    };
+/* Audio playback task - same as original */
+static void audio_playback_task(void *pvParameters) {
+    size_t item_size;
+    int16_t *audio_data;
+    size_t bytes_written;
     
-    const char* voice = "en-US-AriaNeural";
-    int text_index = 0;
-    int text_count = sizeof(test_texts) / sizeof(test_texts[0]);
+    // Allocate a working buffer for I2S (stereo)
+    const size_t i2s_buffer_size = DMA_BUF_LEN * 2 * sizeof(int16_t);  // Stereo
+    int16_t *i2s_buffer = (int16_t *)malloc(i2s_buffer_size);
+    
+    if (!i2s_buffer) {
+        ESP_LOGE(TAG, "Failed to allocate I2S buffer");
+        vTaskDelete(NULL);
+        return;
+    }
+    
+    ESP_LOGI(TAG, "Audio playback task started");
+    
+    while (1) {
+        // Wait for audio data
+        audio_data = (int16_t *)xRingbufferReceive(audio_ring_buf, &item_size, portMAX_DELAY);
+        
+        if (audio_data != NULL && item_size > 0) {
+            // Convert mono to stereo
+            size_t samples = item_size / sizeof(int16_t);
+            size_t stereo_samples = 0;
+            
+            for (size_t i = 0; i < samples && stereo_samples < DMA_BUF_LEN * 2; i++) {
+                i2s_buffer[stereo_samples++] = audio_data[i];  // Left channel
+                i2s_buffer[stereo_samples++] = audio_data[i];  // Right channel
+            }
+            
+            // Write to I2S
+            size_t bytes_to_write = stereo_samples * sizeof(int16_t);
+            i2s_channel_write(tx_handle, i2s_buffer, bytes_to_write, &bytes_written, portMAX_DELAY);
+            
+            audio_state.total_played += item_size;
+            
+            // Return item to ring buffer
+            vRingbufferReturnItem(audio_ring_buf, (void *)audio_data);
+            
+            // Check if playback is complete
+            if (audio_state.stream_done && audio_state.total_played >= audio_state.total_received) {
+                audio_state.is_playing = false;
+                ESP_LOGI(TAG, "Playback complete for audio_id: %s", audio_state.current_audio_id);
+            }
+        }
+    }
+    
+    free(i2s_buffer);
+    vTaskDelete(NULL);
+}
+
+/* TTS polling task */
+static void tts_polling_task(void *pvParameters) {
+    char audio_id[64];
+    
+    ESP_LOGI(TAG, "TTS polling task started, device ID: %s", DEVICE_ID);
+    
+    // Wait a bit for system to stabilize
+    vTaskDelay(pdMS_TO_TICKS(2000));
     
     while (1) {
         // Wait if audio is still playing
-        while (audio_state.is_playing) {
+        if (audio_state.is_playing) {
             vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
         }
         
-        const char* text = test_texts[text_index];
-        ESP_LOGI(TAG, "Requesting TTS: %s", text);
+        // Clear audio_id buffer
+        memset(audio_id, 0, sizeof(audio_id));
         
-        // Stream TTS audio
-        if (stream_tts_audio(text, voice) != ESP_OK) {
-            ESP_LOGE(TAG, "Failed to stream TTS audio");
+        // Poll for new TTS tasks
+        esp_err_t err = poll_for_tts_task(audio_id, sizeof(audio_id));
+        
+        if (err == ESP_OK && strlen(audio_id) > 0) {
+            ESP_LOGI(TAG, "🎵 New TTS task received: %s", audio_id);
+            
+            // Stream the audio PCM data
+            esp_err_t stream_err = stream_audio_pcm(audio_id);
+            if (stream_err == ESP_OK) {
+                ESP_LOGI(TAG, "✅ Successfully started streaming audio: %s", audio_id);
+                
+                // Wait for playback to complete
+                while (audio_state.is_playing || !audio_state.stream_done) {
+                    vTaskDelay(pdMS_TO_TICKS(100));
+                }
+                
+                ESP_LOGI(TAG, "✅ Finished playing audio: %s", audio_id);
+            } else {
+                ESP_LOGE(TAG, "❌ Failed to stream audio for: %s", audio_id);
+            }
+            
+            // Short delay before next poll
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            
+        } else if (err == ESP_ERR_NOT_FOUND) {
+            // No new tasks, this is normal - continue polling immediately
+            ESP_LOGD(TAG, "No new TTS tasks, continuing poll...");
+            // No delay here - the long polling will handle the wait
+        } else {
+            // Real error occurred, wait before retrying
+            ESP_LOGW(TAG, "❌ Poll error (%s), retrying in 5 seconds", esp_err_to_name(err));
+            vTaskDelay(pdMS_TO_TICKS(5000));
         }
-        
-        // Wait for playback to complete
-        while (audio_state.is_playing || !audio_state.stream_done) {
-            vTaskDelay(pdMS_TO_TICKS(100));
-        }
-        
-        // Move to next text
-        text_index = (text_index + 1) % text_count;
-        
-        // Wait before next request
-        vTaskDelay(pdMS_TO_TICKS(5000));  // 5 seconds between requests
     }
 }
 
 void app_main(void) {
-    ESP_LOGI(TAG, "ES8311 Audio Example with WiFi and HTTP");
+    ESP_LOGI(TAG, "ES8311 Audio Example with TTS Polling");
+    ESP_LOGI(TAG, "Device ID: %s", DEVICE_ID);
     ESP_LOGI(TAG, "Free heap: %d bytes", esp_get_free_heap_size());
+    
+    /* Set log level for HTTP client debugging */
+    esp_log_level_set("HTTP_CLIENT", ESP_LOG_DEBUG);
 
     /* Initialize NVS */
     esp_err_t ret = nvs_flash_init();
@@ -522,9 +633,12 @@ void app_main(void) {
     /* Create audio playback task with higher priority */
     xTaskCreate(audio_playback_task, "audio_playback", 4096, NULL, 10, NULL);
 
-    /* Create TTS request task */
-    xTaskCreate(tts_request_task, "tts_request", 4096, NULL, 5, NULL);
+    /* Create TTS polling task */
+    xTaskCreate(tts_polling_task, "tts_polling", 4096, NULL, 5, NULL);
 
-    ESP_LOGI(TAG, "System ready. Streaming audio system started.");
+    ESP_LOGI(TAG, "System ready. TTS polling started.");
     ESP_LOGI(TAG, "Server URL: %s", TTS_SERVER_URL);
+    
+    /* Never reached in this example, but for completeness */
+    /* es8311_delete(codec_handle); */
 }
