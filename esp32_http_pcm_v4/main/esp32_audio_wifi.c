@@ -23,6 +23,7 @@
 #include "esp_event.h"
 #include "esp_http_client.h"
 #include "esp_heap_caps.h"  // 用于PSRAM内存分配
+#include "esp_chip_info.h"  // 用于芯片信息检查
 
 #include "nvs_flash.h"
 #include "driver/i2c.h"
@@ -265,7 +266,7 @@ static esp_err_t poll_for_tts_task(char *audio_id, size_t audio_id_size) {
     esp_http_client_config_t config = {
         .url = TTS_SERVER_URL "/esp32/poll",
         .method = HTTP_METHOD_GET,
-        .timeout_ms = 30000,  // 30秒长轮询
+        .timeout_ms = 20000,  // 临时改为20秒，小于服务器25秒超时
         .event_handler = download_event_handler,
         .user_data = &poll_state,
     };
@@ -663,16 +664,98 @@ static void tts_polling_task(void *pvParameters) {
 
 void app_main(void) {
     ESP_LOGI(TAG, "ESP32 Polling-based TTS Audio Player - PSRAM Enhanced");
-    ESP_LOGI(TAG, "Device ID: %s", DEVICE_ID);
-    ESP_LOGI(TAG, "Free heap: %d bytes", esp_get_free_heap_size());
-    ESP_LOGI(TAG, "Free PSRAM: %d bytes", heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+    ESP_LOGI(TAG, "=================================================");
     
-    // 检查PSRAM是否可用
-    if (heap_caps_get_free_size(MALLOC_CAP_SPIRAM) == 0) {
-        ESP_LOGW(TAG, "⚠️  PSRAM not available! Check sdkconfig settings.");
-    } else {
-        ESP_LOGI(TAG, "✅ PSRAM available: %d bytes", heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+    // 详细的芯片信息检查
+    esp_chip_info_t chip_info;
+    esp_chip_info(&chip_info);
+    
+    ESP_LOGI(TAG, "🔧 Hardware Information:");
+    ESP_LOGI(TAG, "  Chip: %s", CONFIG_IDF_TARGET);
+    ESP_LOGI(TAG, "  Cores: %d", chip_info.cores);
+    ESP_LOGI(TAG, "  Revision: %d", chip_info.revision);
+    ESP_LOGI(TAG, "  Silicon Revision: v%d.%d", chip_info.revision / 100, chip_info.revision % 100);
+    
+    // Flash信息 - 从配置中获取
+    ESP_LOGI(TAG, "  Flash: %s %s", 
+             CONFIG_ESPTOOLPY_FLASHSIZE,
+             (chip_info.features & CHIP_FEATURE_EMB_FLASH) ? "(embedded)" : "(external)");
+    
+    // 芯片特性检查
+    ESP_LOGI(TAG, "  Features:");
+    if (chip_info.features & CHIP_FEATURE_WIFI_BGN) {
+        ESP_LOGI(TAG, "    ✅ WiFi 2.4GHz");
     }
+    if (chip_info.features & CHIP_FEATURE_BT) {
+        ESP_LOGI(TAG, "    ✅ Bluetooth");
+    }
+    if (chip_info.features & CHIP_FEATURE_BLE) {
+        ESP_LOGI(TAG, "    ✅ Bluetooth LE");
+    }
+    if (chip_info.features & CHIP_FEATURE_EMB_PSRAM) {
+        ESP_LOGI(TAG, "    ✅ Embedded PSRAM");
+    } else {
+        ESP_LOGI(TAG, "    ❌ No Embedded PSRAM");
+    }
+    
+    // 内存信息
+    ESP_LOGI(TAG, "💾 Memory Information:");
+    ESP_LOGI(TAG, "  Internal RAM: %d bytes free", esp_get_free_heap_size());
+    ESP_LOGI(TAG, "  Internal RAM: %d bytes total", heap_caps_get_total_size(MALLOC_CAP_INTERNAL));
+    
+    // 检测PSRAM - 使用heap_caps方式
+    size_t psram_free = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+    size_t psram_total = heap_caps_get_total_size(MALLOC_CAP_SPIRAM);
+    
+    ESP_LOGI(TAG, "  External PSRAM: %d bytes free", psram_free);
+    ESP_LOGI(TAG, "  External PSRAM: %d bytes total", psram_total);
+    
+    if (psram_total > 0) {
+        ESP_LOGI(TAG, "✅ PSRAM Status: AVAILABLE (%.1f MB)", 
+                (float)psram_total / (1024 * 1024));
+        
+        // 测试PSRAM分配
+        void *test_ptr = heap_caps_malloc(1024, MALLOC_CAP_SPIRAM);
+        if (test_ptr) {
+            ESP_LOGI(TAG, "✅ PSRAM allocation test: SUCCESS");
+            heap_caps_free(test_ptr);
+        } else {
+            ESP_LOGW(TAG, "❌ PSRAM allocation test: FAILED");
+        }
+    } else {
+        ESP_LOGW(TAG, "❌ PSRAM Status: NOT DETECTED");
+        ESP_LOGW(TAG, "   Possible reasons:");
+        ESP_LOGW(TAG, "   1. Hardware module doesn't have PSRAM (e.g., N16 instead of N16R8)");
+        ESP_LOGW(TAG, "   2. PSRAM configuration issue in sdkconfig");
+        ESP_LOGW(TAG, "   3. Hardware connection problem");
+    }
+    
+    // 根据配置推测模块型号
+    ESP_LOGI(TAG, "🔍 Module Detection:");
+    const char* flash_config = CONFIG_ESPTOOLPY_FLASHSIZE;
+    
+    if (strstr(flash_config, "16MB")) {
+        if (psram_total > 0) {
+            ESP_LOGI(TAG, "  Likely module: ESP32-S3-WROOM-1-N16R8 (16MB Flash + 8MB PSRAM)");
+        } else {
+            ESP_LOGW(TAG, "  Likely module: ESP32-S3-WROOM-1-N16 (16MB Flash, NO PSRAM)");
+        }
+    } else if (strstr(flash_config, "8MB")) {
+        if (psram_total > 0) {
+            ESP_LOGI(TAG, "  Likely module: ESP32-S3-WROOM-1-N8R8 (8MB Flash + 8MB PSRAM)");
+        } else {
+            ESP_LOGW(TAG, "  Likely module: ESP32-S3-WROOM-1-N8 (8MB Flash, NO PSRAM)");
+        }
+    } else {
+        ESP_LOGW(TAG, "  Flash config: %s", flash_config);
+        ESP_LOGW(TAG, "  Unable to determine exact module model");
+    }
+    
+    ESP_LOGI(TAG, "🎵 Audio Configuration:");
+    ESP_LOGI(TAG, "  Device ID: %s", DEVICE_ID);
+    ESP_LOGI(TAG, "  Max audio file size: %d MB", MAX_AUDIO_SIZE / (1024 * 1024));
+    ESP_LOGI(TAG, "  Memory strategy: %s", psram_total > 0 ? "PSRAM + RAM" : "RAM only (with fallback)");
+    ESP_LOGI(TAG, "=================================================");
     
     // 初始化NVS
     esp_err_t ret = nvs_flash_init();
@@ -704,5 +787,4 @@ void app_main(void) {
 
     ESP_LOGI(TAG, "System ready. TTS polling started.");
     ESP_LOGI(TAG, "Server URL: %s", TTS_SERVER_URL);
-    ESP_LOGI(TAG, "Max audio file size: %d MB", MAX_AUDIO_SIZE / (1024 * 1024));
 }
