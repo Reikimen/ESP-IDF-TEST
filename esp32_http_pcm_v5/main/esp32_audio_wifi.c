@@ -1,6 +1,6 @@
 /**
- * ESP32 Polling-based TTS Audio Player
- * 基于轮询的TTS音频播放系统
+ * ESP32 Polling-based TTS Audio Player with PSRAM Support
+ * 基于轮询的TTS音频播放系统 - 使用PSRAM支持大文件
  * ESP32-S3-WROOM-1-N16R8
  */
 
@@ -22,6 +22,7 @@
 #include "esp_wifi.h"
 #include "esp_event.h"
 #include "esp_http_client.h"
+#include "esp_heap_caps.h"  // 用于PSRAM分配
 
 #include "nvs_flash.h"
 #include "driver/i2c.h"
@@ -30,15 +31,18 @@
 
 #include "es8311.h"
 
-/* WiFi Configuration */
-#define WIFI_SSID              "CE-Hub-Student"
-#define WIFI_PASSWORD          "casa-ce-gagarin-public-service"
+/* WiFi Configuration - 保持不变 */
+// #define WIFI_SSID              "CE-Hub-Student"
+// #define WIFI_PASSWORD          "casa-ce-gagarin-public-service"
+#define WIFI_SSID              "CE-Dankao"
+#define WIFI_PASSWORD          "CELAB2025"
 #define WIFI_CONNECTED_BIT     BIT0
 #define WIFI_FAIL_BIT          BIT1
 #define WIFI_MAXIMUM_RETRY     5
 
-/* HTTP Configuration */
-#define TTS_SERVER_IP          "10.129.113.191"  
+/* HTTP Configuration - 保持不变 */
+// #define TTS_SERVER_IP          "10.129.113.191"
+#define TTS_SERVER_IP          "192.168.32.177"
 #define TTS_SERVER_PORT        8001
 #define TTS_SERVER_URL         "http://" TTS_SERVER_IP ":8001"
 #define DEVICE_ID              "ESP32_VOICE_01"
@@ -47,14 +51,14 @@
 #define CODEC_ENABLE_PIN       GPIO_NUM_6   // PREP_VCC_CTL - ES8311 power enable
 #define PA_CTRL_PIN            GPIO_NUM_40  // Power amplifier control pin
 
-/* I2C Configuration */
+/* I2C Configuration - 保持不变 */
 #define I2C_MASTER_NUM         I2C_NUM_0
 #define I2C_MASTER_SCL_IO      GPIO_NUM_1  
 #define I2C_MASTER_SDA_IO      GPIO_NUM_2   
 #define I2C_MASTER_FREQ_HZ     50000
 #define ES8311_I2C_ADDR        0x18
 
-/* I2S Configuration */
+/* I2S Configuration - 保持不变 */
 #define I2S_NUM                I2S_NUM_0
 #define I2S_BCK_IO             GPIO_NUM_16  
 #define I2S_WS_IO              GPIO_NUM_17  
@@ -67,9 +71,9 @@
 #define DMA_BUF_LEN            1024
 #define DMA_BUF_COUNT          8
 
-/* Audio buffer configuration */
-#define MAX_AUDIO_SIZE         (1024 * 1024)
-#define DOWNLOAD_CHUNK_SIZE    (16 * 1024)
+/* Audio buffer configuration - 使用PSRAM后可以增大缓冲区 */
+#define MAX_AUDIO_SIZE         (4 * 1024 * 1024)  // 增大到4MB
+#define DOWNLOAD_CHUNK_SIZE    (64 * 1024)        // 增大到64KB
 #define POLL_INTERVAL_MS       2000       
 
 static const char *TAG = "ESP32_POLLING_AUDIO";
@@ -83,7 +87,7 @@ typedef struct {
     bool is_playing;
     bool has_audio;
     bool download_complete;
-    uint8_t *audio_buffer;
+    uint8_t *audio_buffer;      // 将使用PSRAM分配
     size_t audio_size;
     size_t audio_capacity;
     size_t audio_position;
@@ -99,7 +103,26 @@ typedef struct {
     size_t capacity;
 } download_state_t;
 
-/* WiFi事件处理器 */
+/* 使用PSRAM分配内存的辅助函数 */
+static void* psram_malloc(size_t size) {
+    void *ptr = heap_caps_malloc(size, MALLOC_CAP_SPIRAM);
+    if (!ptr) {
+        ESP_LOGW(TAG, "PSRAM allocation failed, falling back to internal RAM");
+        ptr = malloc(size);
+    }
+    return ptr;
+}
+
+static void* psram_realloc(void *ptr, size_t size) {
+    void *new_ptr = heap_caps_realloc(ptr, size, MALLOC_CAP_SPIRAM);
+    if (!new_ptr) {
+        ESP_LOGW(TAG, "PSRAM reallocation failed, trying internal RAM");
+        new_ptr = realloc(ptr, size);
+    }
+    return new_ptr;
+}
+
+/* WiFi事件处理器 - 保持不变 */
 static void wifi_event_handler(void* arg, esp_event_base_t event_base,
                               int32_t event_id, void* event_data) {
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
@@ -121,7 +144,7 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
     }
 }
 
-/* WiFi初始化 */
+/* WiFi初始化 - 保持不变 */
 static esp_err_t wifi_init_sta(void) {
     s_wifi_event_group = xEventGroupCreate();
 
@@ -176,7 +199,7 @@ static esp_err_t wifi_init_sta(void) {
     }
 }
 
-/* HTTP下载事件处理器 */
+/* HTTP下载事件处理器 - 修改为使用PSRAM */
 static esp_err_t download_event_handler(esp_http_client_event_t *evt) {
     download_state_t *download_state = (download_state_t *)evt->user_data;
     
@@ -193,14 +216,14 @@ static esp_err_t download_event_handler(esp_http_client_event_t *evt) {
                             return ESP_OK;
                         }
                     } else {
-                        uint8_t *new_buffer = realloc(download_state->buffer, new_capacity);
+                        uint8_t *new_buffer = psram_realloc(download_state->buffer, new_capacity);
                         if (!new_buffer) {
                             ESP_LOGE(TAG, "Failed to reallocate download buffer");
                             return ESP_FAIL;
                         }
                         download_state->buffer = new_buffer;
                         download_state->capacity = new_capacity;
-                        ESP_LOGD(TAG, "Expanded buffer to %d bytes", new_capacity);
+                        ESP_LOGD(TAG, "Expanded buffer to %d bytes in PSRAM", new_capacity);
                     }
                 }
                 
@@ -222,7 +245,7 @@ static esp_err_t download_event_handler(esp_http_client_event_t *evt) {
     return ESP_OK;
 }
 
-/* 轮询新的TTS任务 */
+/* 轮询新的TTS任务 - 保持HTTP API调用不变 */
 static esp_err_t poll_for_tts_task(char *audio_id, size_t audio_id_size) {
     char poll_buffer[1024];
     download_state_t poll_state = {
@@ -298,13 +321,14 @@ static esp_err_t poll_for_tts_task(char *audio_id, size_t audio_id_size) {
     return err;
 }
 
-/* 下载PCM音频文件 */
+/* 下载PCM音频文件 - 修改为使用PSRAM */
 static esp_err_t download_pcm_audio(const char *audio_id) {
     char url[256];
     snprintf(url, sizeof(url), "%s/audio/%s.pcm", TTS_SERVER_URL, audio_id);
     
     ESP_LOGI(TAG, "Downloading PCM: %s", url);
     ESP_LOGI(TAG, "Free heap before download: %d bytes", esp_get_free_heap_size());
+    ESP_LOGI(TAG, "Free PSRAM: %d bytes", heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
     
     // 释放之前的音频缓冲区
     if (audio_state.audio_buffer) {
@@ -312,8 +336,8 @@ static esp_err_t download_pcm_audio(const char *audio_id) {
         audio_state.audio_buffer = NULL;
     }
     
-    // 分配初始缓冲区
-    uint8_t *initial_buffer = malloc(DOWNLOAD_CHUNK_SIZE);
+    // 在PSRAM中分配初始缓冲区
+    uint8_t *initial_buffer = psram_malloc(DOWNLOAD_CHUNK_SIZE);
     if (!initial_buffer) {
         ESP_LOGE(TAG, "Failed to allocate initial download buffer");
         return ESP_FAIL;
@@ -357,6 +381,7 @@ static esp_err_t download_pcm_audio(const char *audio_id) {
             
             ESP_LOGI(TAG, "Downloaded %d bytes for audio: %s", download_state.size, audio_id);
             ESP_LOGI(TAG, "Free heap after download: %d bytes", esp_get_free_heap_size());
+            ESP_LOGI(TAG, "Free PSRAM after download: %d bytes", heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
         } else {
             ESP_LOGW(TAG, "Download failed: status=%d, size=%d", status_code, download_state.size);
             free(download_state.buffer);
@@ -371,7 +396,7 @@ static esp_err_t download_pcm_audio(const char *audio_id) {
     return err;
 }
 
-/* I2C初始化 */
+/* I2C初始化 - 保持不变 */
 static esp_err_t i2c_master_init(void) {
     int i2c_master_port = I2C_MASTER_NUM;
     
@@ -389,7 +414,7 @@ static esp_err_t i2c_master_init(void) {
     return i2c_driver_install(i2c_master_port, conf.mode, 0, 0, 0);
 }
 
-/* ES8311编解码器初始化 */
+/* ES8311编解码器初始化 - 保持不变 */
 static esp_err_t es8311_codec_init(es8311_handle_t *codec_handle) {
     // 启用编解码器电源
     gpio_reset_pin(CODEC_ENABLE_PIN);
@@ -411,7 +436,7 @@ static esp_err_t es8311_codec_init(es8311_handle_t *codec_handle) {
         return ESP_FAIL;
     }
 
-    // 配置ES8311时钟 - 修复时钟配置
+    // 配置ES8311时钟
     es8311_clock_config_t clk_cfg = {
         .mclk_inverted = false,
         .sclk_inverted = false,
@@ -434,7 +459,7 @@ static esp_err_t es8311_codec_init(es8311_handle_t *codec_handle) {
     return ESP_OK;
 }
 
-/* I2S初始化 */
+/* I2S初始化 - 保持不变 */
 static esp_err_t i2s_init(void) {
     i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM, I2S_ROLE_MASTER);
     chan_cfg.dma_desc_num = DMA_BUF_COUNT;
@@ -468,7 +493,7 @@ static esp_err_t i2s_init(void) {
     return ESP_OK;
 }
 
-/* 简单的上采样函数：16kHz -> 48kHz (3倍上采样) */
+/* 简单的上采样函数：16kHz -> 48kHz (3倍上采样) - 保持不变 */
 static void upsample_audio(int16_t *input, size_t input_samples, int16_t *output, size_t *output_samples) {
     *output_samples = 0;
     
@@ -480,11 +505,11 @@ static void upsample_audio(int16_t *input, size_t input_samples, int16_t *output
     }
 }
 
-/* 音频播放任务 */
+/* 音频播放任务 - 播放缓冲区使用内部RAM以保证性能 */
 static void audio_playback_task(void *pvParameters) {
     size_t bytes_written;
     const size_t chunk_size = DMA_BUF_LEN * 2 * sizeof(int16_t);  // 立体声缓冲区大小
-    int16_t *stereo_buffer = malloc(chunk_size);
+    int16_t *stereo_buffer = malloc(chunk_size);  // 使用内部RAM以保证I2S性能
     int16_t *upsampled_buffer = malloc(DMA_BUF_LEN * 3 * sizeof(int16_t));  // 上采样缓冲区
     
     if (!stereo_buffer || !upsampled_buffer) {
@@ -519,6 +544,7 @@ static void audio_playback_task(void *pvParameters) {
                     free(audio_state.audio_buffer);
                     audio_state.audio_buffer = NULL;
                     ESP_LOGI(TAG, "Audio buffer freed, heap: %d bytes", esp_get_free_heap_size());
+                    ESP_LOGI(TAG, "PSRAM free: %d bytes", heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
                 }
                 continue;
             }
@@ -529,7 +555,7 @@ static void audio_playback_task(void *pvParameters) {
                 input_chunk_size = remaining;
             }
             
-            // 获取输入数据
+            // 获取输入数据（从PSRAM）
             int16_t *input_data = (int16_t *)(audio_state.audio_buffer + audio_state.audio_position);
             size_t input_samples = input_chunk_size / sizeof(int16_t);
             
@@ -568,7 +594,7 @@ static void audio_playback_task(void *pvParameters) {
     vTaskDelete(NULL);
 }
 
-/* TTS轮询任务 */
+/* TTS轮询任务 - 保持不变 */
 static void tts_polling_task(void *pvParameters) {
     char audio_id[64];
     
@@ -623,9 +649,18 @@ static void tts_polling_task(void *pvParameters) {
 }
 
 void app_main(void) {
-    ESP_LOGI(TAG, "ESP32 Polling-based TTS Audio Player");
+    ESP_LOGI(TAG, "ESP32 Polling-based TTS Audio Player with PSRAM Support");
     ESP_LOGI(TAG, "Device ID: %s", DEVICE_ID);
     ESP_LOGI(TAG, "Free heap: %d bytes", esp_get_free_heap_size());
+    
+    // 检查PSRAM
+    size_t psram_size = heap_caps_get_total_size(MALLOC_CAP_SPIRAM);
+    if (psram_size > 0) {
+        ESP_LOGI(TAG, "PSRAM detected: %d bytes total, %d bytes free", 
+                psram_size, heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+    } else {
+        ESP_LOGW(TAG, "No PSRAM detected! Large audio files may fail.");
+    }
     
     // 初始化NVS
     esp_err_t ret = nvs_flash_init();
