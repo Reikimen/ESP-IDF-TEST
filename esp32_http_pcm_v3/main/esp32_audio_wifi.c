@@ -1,4 +1,4 @@
-/* ESP32 HTTP PCM Audio Player with WiFi - PSRAM Optimized Version
+/* ESP32 HTTP PCM Audio Player with WiFi - PSRAM Optimized Version (Fixed)
  * This version uses PSRAM for large audio buffer storage
  */
 
@@ -22,7 +22,7 @@
 #include "lwip/sys.h"
 
 /* Network Configuration */
-#define TTS_SERVER_URL         "http://192.168.31.115:3031"
+#define TTS_SERVER_URL         "http://10.129.113.191:8001"  // 更新为您的服务器地址
 #define DEVICE_ID              "ESP32_VOICE_01"
 
 /* WiFi Configuration */
@@ -47,6 +47,7 @@
 #define PA_CTRL_PIN            GPIO_NUM_40
 
 /* I2S Configuration */
+#define I2S_NUM                I2S_NUM_0
 #define I2S_BCK_IO             GPIO_NUM_16  
 #define I2S_WS_IO              GPIO_NUM_17  
 #define I2S_DO_IO              GPIO_NUM_18  
@@ -117,29 +118,6 @@ static void* audio_malloc(size_t size) {
     return ptr;
 }
 
-/* 内存重分配辅助函数 */
-static void* audio_realloc(void *ptr, size_t size) {
-    if (!ptr) {
-        return audio_malloc(size);
-    }
-    
-    // 对于大内存，尝试在PSRAM中重新分配
-    if (size > 16 * 1024 && esp_psram_is_initialized()) {
-        void *new_ptr = heap_caps_realloc(ptr, size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-        if (new_ptr) {
-            ESP_LOGD(TAG, "Reallocated %d bytes in PSRAM", size);
-            return new_ptr;
-        }
-    }
-    
-    // 否则使用内部RAM
-    void *new_ptr = heap_caps_realloc(ptr, size, MALLOC_CAP_DEFAULT);
-    if (new_ptr) {
-        ESP_LOGD(TAG, "Reallocated %d bytes in internal RAM", size);
-    }
-    return new_ptr;
-}
-
 /* WiFi事件处理器 */
 static void wifi_event_handler(void* arg, esp_event_base_t event_base,
                               int32_t event_id, void* event_data) {
@@ -167,6 +145,7 @@ static esp_err_t wifi_init_sta(void) {
     s_wifi_event_group = xEventGroupCreate();
 
     ESP_ERROR_CHECK(esp_netif_init());
+
     ESP_ERROR_CHECK(esp_event_loop_create_default());
     esp_netif_create_default_wifi_sta();
 
@@ -243,7 +222,7 @@ static esp_err_t download_event_handler(esp_http_client_event_t *evt) {
             if (!esp_http_client_is_chunked_response(evt->client)) {
                 // 检查是否需要扩展缓冲区
                 while (download_state->size + evt->data_len > download_state->capacity) {
-                    size_t new_capacity = download_state->capacity * 2;  // 2倍扩展
+                    size_t new_capacity = download_state->capacity * 2;
                     
                     // 检查是否超过最大限制
                     if (new_capacity > MAX_AUDIO_SIZE) {
@@ -257,17 +236,31 @@ static esp_err_t download_event_handler(esp_http_client_event_t *evt) {
                         }
                     }
                     
-                    // 使用优化的重分配函数
-                    uint8_t *new_buffer = audio_realloc(download_state->buffer, new_capacity);
+                    // 分配新的更大的缓冲区
+                    uint8_t *new_buffer = audio_malloc(new_capacity);
                     if (!new_buffer) {
-                        ESP_LOGE(TAG, "Failed to reallocate download buffer");
+                        ESP_LOGE(TAG, "Failed to allocate larger buffer");
                         return ESP_FAIL;
                     }
+                    
+                    // 复制现有数据到新缓冲区
+                    if (download_state->size > 0) {
+                        memcpy(new_buffer, download_state->buffer, download_state->size);
+                    }
+                    
+                    // 释放旧缓冲区
+                    free(download_state->buffer);
+                    
+                    // 更新状态
                     download_state->buffer = new_buffer;
                     download_state->capacity = new_capacity;
-                    ESP_LOGD(TAG, "Expanded buffer to %d bytes", new_capacity);
+                    download_state->use_psram = (new_capacity > 16 * 1024 && esp_psram_is_initialized());
+                    
+                    ESP_LOGI(TAG, "Expanded buffer to %d bytes in %s", 
+                             new_capacity, download_state->use_psram ? "PSRAM" : "Internal RAM");
                 }
                 
+                // 复制新数据
                 if (evt->data_len > 0) {
                     memcpy(download_state->buffer + download_state->size, evt->data, evt->data_len);
                     download_state->size += evt->data_len;
@@ -290,7 +283,7 @@ static esp_err_t download_event_handler(esp_http_client_event_t *evt) {
     return ESP_OK;
 }
 
-/* 轮询新的TTS任务 - 增加重试机制 */
+/* 轮询新的TTS任务 */
 static esp_err_t poll_for_tts_task(char *audio_id, size_t audio_id_size) {
     char poll_buffer[1024];
     download_state_t poll_state = {
@@ -306,11 +299,7 @@ static esp_err_t poll_for_tts_task(char *audio_id, size_t audio_id_size) {
         .timeout_ms = 30000,  // 30秒长轮询
         .event_handler = download_event_handler,
         .user_data = &poll_state,
-        .disable_auto_redirect = true,
-        .keep_alive_enable = true,
-        .keep_alive_idle = 30,
-        .keep_alive_interval = 10,
-        .keep_alive_count = 3,
+        .buffer_size = 512,
     };
     
     esp_http_client_handle_t client = esp_http_client_init(&config);
@@ -319,6 +308,7 @@ static esp_err_t poll_for_tts_task(char *audio_id, size_t audio_id_size) {
         return ESP_FAIL;
     }
     
+    // 设置设备ID头
     esp_http_client_set_header(client, "X-Device-ID", DEVICE_ID);
     
     ESP_LOGD(TAG, "Polling for new tasks...");
@@ -329,35 +319,25 @@ static esp_err_t poll_for_tts_task(char *audio_id, size_t audio_id_size) {
         int status_code = esp_http_client_get_status_code(client);
         
         if (status_code == 200 && poll_state.size > 0) {
+            // 确保字符串结束
             poll_buffer[poll_state.size] = '\0';
-            ESP_LOGI(TAG, "Poll response: %s", poll_buffer);
+            ESP_LOGD(TAG, "Poll response: %s", poll_buffer);
             
-            // 简单JSON解析提取audio_id
+            // 简单解析JSON响应找到audio_id
             char *audio_id_start = strstr(poll_buffer, "\"audio_id\":\"");
             if (audio_id_start) {
-                audio_id_start += 12;
+                audio_id_start += 12;  // Skip past "audio_id":"
                 char *audio_id_end = strchr(audio_id_start, '"');
                 if (audio_id_end) {
                     size_t id_len = audio_id_end - audio_id_start;
                     if (id_len < audio_id_size - 1) {
                         strncpy(audio_id, audio_id_start, id_len);
                         audio_id[id_len] = '\0';
-                        ESP_LOGI(TAG, "New TTS task: %s", audio_id);
-                        err = ESP_OK;
-                    } else {
-                        ESP_LOGW(TAG, "Audio ID too long");
-                        err = ESP_FAIL;
+                        ESP_LOGI(TAG, "Found new audio task: %s", audio_id);
                     }
-                } else {
-                    ESP_LOGW(TAG, "Failed to parse audio_id");
-                    err = ESP_FAIL;
                 }
-            } else {
-                ESP_LOGW(TAG, "No audio_id found in response");
-                err = ESP_FAIL;
             }
         } else if (status_code == 204) {
-            // 无内容 - 无新任务
             ESP_LOGD(TAG, "No new tasks (204)");
             err = ESP_ERR_NOT_FOUND;
         } else {
@@ -433,9 +413,6 @@ static esp_err_t download_pcm_audio(const char *audio_id) {
         .event_handler = download_event_handler,
         .user_data = &download_state,
         .buffer_size = 4096,
-        .disable_auto_redirect = true,
-        .max_redirection_count = 0,
-        .max_authorization_retries = 0,
     };
     
     esp_http_client_handle_t client = esp_http_client_init(&config);
@@ -548,7 +525,7 @@ static esp_err_t es8311_codec_init(es8311_handle_t *codec_handle) {
         .mclk_inverted = false,
         .sclk_inverted = false,
         .mclk_from_mclk_pin = false,  // Use SCLK pin as MCLK source
-        .mclk_frequency = 0,          // Ignored when using SCLK as MCLK
+        .mclk_frequency = 0,          // Ignored when using SCLK
         .sample_frequency = SAMPLE_RATE,
     };
     
@@ -558,15 +535,15 @@ static esp_err_t es8311_codec_init(es8311_handle_t *codec_handle) {
         ESP_LOGE(TAG, "Failed to initialize ES8311: %s", esp_err_to_name(ret));
         return ret;
     }
-
-    /* Configure for analog microphone (not digital) */
-    ESP_ERROR_CHECK(es8311_microphone_config(*codec_handle, false));
     
-    /* Set voice volume */
-    ESP_ERROR_CHECK(es8311_voice_volume_set(*codec_handle, 70, NULL));
+    /* Configure microphone (analog) */
+    es8311_microphone_config(*codec_handle, false);
     
-    /* Unmute the output */
-    ESP_ERROR_CHECK(es8311_voice_mute(*codec_handle, false));
+    /* Set output volume (0-100) */
+    es8311_voice_volume_set(*codec_handle, 70, NULL);
+    
+    /* Unmute output */
+    es8311_voice_mute(*codec_handle, false);
     
     ESP_LOGI(TAG, "ES8311 codec initialized successfully at %dHz", SAMPLE_RATE);
     return ESP_OK;
@@ -574,10 +551,16 @@ static esp_err_t es8311_codec_init(es8311_handle_t *codec_handle) {
 
 /* Initialize I2S */
 static esp_err_t i2s_init(void) {
-    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
+    /* I2S channel configuration */
+    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM, I2S_ROLE_MASTER);
+    chan_cfg.dma_desc_num = DMA_BUF_COUNT;
+    chan_cfg.dma_frame_num = DMA_BUF_LEN;
     chan_cfg.auto_clear = true;
+    
+    /* Create I2S channel */
     ESP_ERROR_CHECK(i2s_new_channel(&chan_cfg, &tx_handle, &rx_handle));
-
+    
+    /* I2S standard configuration */
     i2s_std_config_t std_cfg = {
         .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(SAMPLE_RATE),
         .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO),
@@ -594,37 +577,26 @@ static esp_err_t i2s_init(void) {
             },
         },
     };
-
+    
+    /* Initialize TX channel */
     ESP_ERROR_CHECK(i2s_channel_init_std_mode(tx_handle, &std_cfg));
-    ESP_ERROR_CHECK(i2s_channel_init_std_mode(rx_handle, &std_cfg));
     ESP_ERROR_CHECK(i2s_channel_enable(tx_handle));
-    ESP_ERROR_CHECK(i2s_channel_enable(rx_handle));
-
+    
+    /* Initialize RX channel if needed */
+    if (rx_handle) {
+        ESP_ERROR_CHECK(i2s_channel_init_std_mode(rx_handle, &std_cfg));
+        ESP_ERROR_CHECK(i2s_channel_enable(rx_handle));
+    }
+    
     ESP_LOGI(TAG, "I2S initialized successfully");
     return ESP_OK;
 }
 
-/* 简单的上采样函数：16kHz -> 48kHz (3倍上采样) */
-static void upsample_audio(int16_t *input, size_t input_samples, int16_t *output, size_t *output_samples) {
-    *output_samples = 0;
-    
-    for (size_t i = 0; i < input_samples; i++) {
-        // 每个输入样本复制3次
-        output[(*output_samples)++] = input[i];
-        output[(*output_samples)++] = input[i];
-        output[(*output_samples)++] = input[i];
-    }
-}
-
 /* 音频播放任务 */
 static void audio_playback_task(void *pvParameters) {
-    size_t bytes_written;
-    const size_t chunk_size = DMA_BUF_LEN * 2 * sizeof(int16_t);  // 立体声缓冲区大小
-    int16_t *stereo_buffer = malloc(chunk_size);
-    int16_t *upsampled_buffer = malloc(DMA_BUF_LEN * 3 * sizeof(int16_t));  // 上采样缓冲区
-    
-    if (!stereo_buffer || !upsampled_buffer) {
-        ESP_LOGE(TAG, "Failed to allocate audio buffers");
+    uint8_t *i2s_write_buff = heap_caps_malloc(DMA_BUF_LEN * 2, MALLOC_CAP_DMA);
+    if (!i2s_write_buff) {
+        ESP_LOGE(TAG, "Failed to allocate I2S write buffer");
         vTaskDelete(NULL);
         return;
     }
@@ -633,133 +605,105 @@ static void audio_playback_task(void *pvParameters) {
     
     while (1) {
         if (audio_state.has_audio && !audio_state.is_playing) {
-            // 开始播放
             audio_state.is_playing = true;
             audio_state.audio_position = 0;
-            ESP_LOGI(TAG, "Started playing audio: %s (%d bytes from %s)", 
-                    audio_state.current_audio_id, audio_state.audio_size,
-                    audio_state.use_psram ? "PSRAM" : "Internal RAM");
+            ESP_LOGI(TAG, "Starting playback of audio: %s (%d bytes)", 
+                     audio_state.current_audio_id, audio_state.audio_size);
         }
         
-        if (audio_state.is_playing && audio_state.has_audio) {
-            // 计算这次要播放的数据量
-            size_t remaining = audio_state.audio_size - audio_state.audio_position;
-            if (remaining == 0) {
+        if (audio_state.is_playing) {
+            size_t bytes_to_play = audio_state.audio_size - audio_state.audio_position;
+            if (bytes_to_play > 0) {
+                if (bytes_to_play > DMA_BUF_LEN * 2) {
+                    bytes_to_play = DMA_BUF_LEN * 2;
+                }
+                
+                // 复制音频数据到DMA缓冲区
+                memcpy(i2s_write_buff, 
+                       audio_state.audio_buffer + audio_state.audio_position, 
+                       bytes_to_play);
+                
+                // 写入I2S
+                size_t bytes_written = 0;
+                esp_err_t ret = i2s_channel_write(tx_handle, i2s_write_buff, 
+                                                 bytes_to_play, &bytes_written, 
+                                                 portMAX_DELAY);
+                
+                if (ret == ESP_OK) {
+                    audio_state.audio_position += bytes_written;
+                    
+                    // 打印进度（每10%）
+                    static int last_progress = -1;
+                    int progress = (audio_state.audio_position * 100) / audio_state.audio_size;
+                    if (progress / 10 != last_progress / 10) {
+                        ESP_LOGI(TAG, "Playback progress: %d%%", progress);
+                        last_progress = progress;
+                    }
+                }
+            } else {
                 // 播放完成
+                ESP_LOGI(TAG, "Playback completed for audio: %s", audio_state.current_audio_id);
                 audio_state.is_playing = false;
                 audio_state.has_audio = false;
-                audio_state.download_complete = false;
-                ESP_LOGI(TAG, "Playback complete: %s", audio_state.current_audio_id);
                 
                 // 释放音频缓冲区
                 if (audio_state.audio_buffer) {
                     free(audio_state.audio_buffer);
                     audio_state.audio_buffer = NULL;
-                    ESP_LOGI(TAG, "Audio buffer freed");
-                    ESP_LOGI(TAG, "Free heap: %d bytes, Free PSRAM: %d bytes", 
-                             esp_get_free_heap_size(), 
-                             heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
                 }
-                continue;
-            }
-            
-            // 确定这次播放的样本数量（16kHz单声道输入）
-            size_t input_chunk_size = (DMA_BUF_LEN / 3) * sizeof(int16_t);  // 考虑3倍上采样
-            if (remaining < input_chunk_size) {
-                input_chunk_size = remaining;
-            }
-            
-            // 获取输入数据
-            int16_t *input_data = (int16_t *)(audio_state.audio_buffer + audio_state.audio_position);
-            size_t input_samples = input_chunk_size / sizeof(int16_t);
-            
-            // 上采样：16kHz -> 48kHz
-            size_t upsampled_samples;
-            upsample_audio(input_data, input_samples, upsampled_buffer, &upsampled_samples);
-            
-            // 转换单声道为立体声
-            for (size_t i = 0; i < upsampled_samples && i * 2 + 1 < DMA_BUF_LEN * 2; i++) {
-                stereo_buffer[i * 2] = upsampled_buffer[i];      // 左声道
-                stereo_buffer[i * 2 + 1] = upsampled_buffer[i];  // 右声道
-            }
-            
-            // 写入I2S
-            size_t stereo_bytes = upsampled_samples * 2 * sizeof(int16_t);
-            if (stereo_bytes > chunk_size) {
-                stereo_bytes = chunk_size;
-            }
-            
-            esp_err_t ret = i2s_channel_write(tx_handle, stereo_buffer, stereo_bytes, &bytes_written, portMAX_DELAY);
-            
-            if (ret == ESP_OK) {
-                audio_state.audio_position += input_chunk_size;
-            } else {
-                ESP_LOGE(TAG, "I2S write failed: %s", esp_err_to_name(ret));
-                vTaskDelay(pdMS_TO_TICKS(10));
             }
         } else {
-            // 没有音频时暂停
             vTaskDelay(pdMS_TO_TICKS(10));
         }
     }
-    
-    free(stereo_buffer);
-    free(upsampled_buffer);
-    vTaskDelete(NULL);
 }
 
 /* TTS轮询任务 */
 static void tts_polling_task(void *pvParameters) {
-    char audio_id[64];
-    
     ESP_LOGI(TAG, "TTS polling task started, device ID: %s", DEVICE_ID);
     
-    // 等待系统稳定
-    vTaskDelay(pdMS_TO_TICKS(3000));
-    
     while (1) {
-        // 如果当前没有音频在播放或下载，则轮询新任务
-        if (!audio_state.has_audio || (!audio_state.is_playing && audio_state.download_complete)) {
+        // 如果当前没有音频或已播放完成，则轮询新任务
+        if (!audio_state.has_audio) {
+            char audio_id[64] = {0};
             esp_err_t err = poll_for_tts_task_with_retry(audio_id, sizeof(audio_id));
             
-            if (err == ESP_OK) {
-                // 有新的TTS任务，下载音频
+            if (err == ESP_OK && strlen(audio_id) > 0) {
+                ESP_LOGI(TAG, "New TTS task received: %s", audio_id);
+                
+                // 下载音频
                 err = download_pcm_audio_with_retry(audio_id);
                 if (err != ESP_OK) {
                     ESP_LOGE(TAG, "Failed to download audio: %s", audio_id);
                 }
             } else if (err == ESP_ERR_NOT_FOUND) {
-                // 没有新任务，继续轮询
-                ESP_LOGD(TAG, "No new TTS tasks");
-            } else {
-                // 轮询失败，等待后重试
-                ESP_LOGW(TAG, "Polling failed, will retry");
-                vTaskDelay(pdMS_TO_TICKS(5000));
-                continue;
+                ESP_LOGD(TAG, "No new tasks available");
             }
         }
         
-        // 轮询间隔
         vTaskDelay(pdMS_TO_TICKS(POLL_INTERVAL_MS));
     }
-    
-    vTaskDelete(NULL);
 }
 
-/* 系统信息任务 - 监控内存使用 */
+/* 系统信息任务 */
 static void system_info_task(void *pvParameters) {
+    ESP_LOGI(TAG, "System Info - Free heap: %d bytes, Free PSRAM: %d bytes, Min heap: %d bytes",
+             esp_get_free_heap_size(),
+             heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+             esp_get_minimum_free_heap_size());
+    
     while (1) {
         ESP_LOGI(TAG, "System Info - Free heap: %d bytes, Free PSRAM: %d bytes, Min heap: %d bytes",
                  esp_get_free_heap_size(),
                  heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
                  esp_get_minimum_free_heap_size());
         
-        if (audio_state.has_audio) {
-            ESP_LOGI(TAG, "Audio buffer: %d bytes in %s, Position: %d/%d",
-                     audio_state.audio_capacity,
-                     audio_state.use_psram ? "PSRAM" : "Internal RAM",
+        if (audio_state.is_playing) {
+            ESP_LOGI(TAG, "Audio playing: %s, progress: %d/%d bytes (buffer in %s)",
+                     audio_state.current_audio_id,
                      audio_state.audio_position,
-                     audio_state.audio_size);
+                     audio_state.audio_size,
+                     audio_state.use_psram ? "PSRAM" : "Internal RAM");
         }
         
         vTaskDelay(pdMS_TO_TICKS(10000));  // 每10秒打印一次
