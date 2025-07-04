@@ -1,0 +1,13 @@
+# ESP32-S3 Partition Table for 16MB Flash
+# Name,     Type, SubType,  Offset,   Size,    Flags
+# Note: if you have increased the bootloader size, make sure to update the offsets to avoid overlap
+nvs,        data, nvs,      0x9000,   0x6000,
+phy_init,   data, phy,      0xf000,   0x1000,
+# Factory app partition - 2MB
+factory,    app,  factory,  0x10000,  0x200000,
+# OTA app partition 0 - 2MB
+ota_0,      app,  ota_0,    0x210000, 0x200000,
+# OTA app partition 1 - 2MB
+ota_1,      app,  ota_1,    0x410000, 0x200000,
+# SPIFFS partition - approximately 10MB for audio file storage
+spiffs,     data, spiffs,   0x610000, 0x9F0000,
