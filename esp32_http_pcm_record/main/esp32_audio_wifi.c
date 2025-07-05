@@ -445,36 +445,54 @@ static esp_err_t download_pcm_audio(const char *audio_id) {
     return err;
 }
 
-/* 上传录音到STT服务 - 新增函数 */
+/* 上传录音到STT服务 - 修改版本 */
 static esp_err_t upload_recording_to_stt(uint8_t *recording_data, size_t recording_size) {
     char url[256];
     snprintf(url, sizeof(url), "%s/upload_pcm", STT_SERVER_URL);
     
     ESP_LOGI(TAG, "Uploading PCM recording to STT: %d bytes", recording_size);
     ESP_LOGI(TAG, "STT URL: %s", url);
+    ESP_LOGI(TAG, "Device ID: %s", DEVICE_ID);
     
     // 创建multipart/form-data
     char boundary[] = "----ESP32FormBoundary";
     char content_type[128];
     snprintf(content_type, sizeof(content_type), "multipart/form-data; boundary=%s", boundary);
     
+    // 获取时间戳
+    time_t upload_timestamp = time(NULL);
+    
     // 构建multipart body
-    char header[512];
-    snprintf(header, sizeof(header),
+    // 1. 添加device_id字段（可选但推荐）
+    char device_field[256];
+    snprintf(device_field, sizeof(device_field),
+        "--%s\r\n"
+        "Content-Disposition: form-data; name=\"device_id\"\r\n\r\n"
+        "%s\r\n",
+        boundary, DEVICE_ID);
+    
+    // 2. 添加文件字段，确保文件名格式正确
+    char file_field[512];
+    snprintf(file_field, sizeof(file_field),
         "--%s\r\n"
         "Content-Disposition: form-data; name=\"file\"; filename=\"esp32_%s_%ld.pcm\"\r\n"
         "Content-Type: application/octet-stream\r\n\r\n",
-        boundary, DEVICE_ID, (long)time(NULL));
+        boundary, DEVICE_ID, (long)upload_timestamp);
     
     char footer[128];
     snprintf(footer, sizeof(footer), "\r\n--%s--\r\n", boundary);
     
-    size_t total_size = strlen(header) + recording_size + strlen(footer);
+    // 计算总大小
+    size_t total_size = strlen(device_field) + strlen(file_field) + recording_size + strlen(footer);
+    
+    ESP_LOGI(TAG, "Multipart total size: %d bytes", total_size);
+    ESP_LOGI(TAG, "Filename: esp32_%s_%ld.pcm", DEVICE_ID, (long)upload_timestamp);
     
     esp_http_client_config_t config = {
         .url = url,
         .method = HTTP_METHOD_POST,
         .timeout_ms = 30000,
+        .buffer_size = 4096,  // 增加缓冲区大小
     };
     
     esp_http_client_handle_t client = esp_http_client_init(&config);
@@ -485,6 +503,7 @@ static esp_err_t upload_recording_to_stt(uint8_t *recording_data, size_t recordi
     
     // 设置headers
     esp_http_client_set_header(client, "Content-Type", content_type);
+    esp_http_client_set_header(client, "X-Device-ID", DEVICE_ID);  // 额外添加header作为备份
     
     // 打开连接
     esp_err_t err = esp_http_client_open(client, total_size);
@@ -494,10 +513,19 @@ static esp_err_t upload_recording_to_stt(uint8_t *recording_data, size_t recordi
         return err;
     }
     
-    // 发送multipart header
-    int wlen = esp_http_client_write(client, header, strlen(header));
+    // 发送device_id字段
+    int wlen = esp_http_client_write(client, device_field, strlen(device_field));
     if (wlen < 0) {
-        ESP_LOGE(TAG, "Failed to write multipart header");
+        ESP_LOGE(TAG, "Failed to write device_id field");
+        esp_http_client_close(client);
+        esp_http_client_cleanup(client);
+        return ESP_FAIL;
+    }
+    
+    // 发送文件字段header
+    wlen = esp_http_client_write(client, file_field, strlen(file_field));
+    if (wlen < 0) {
+        ESP_LOGE(TAG, "Failed to write file field header");
         esp_http_client_close(client);
         esp_http_client_cleanup(client);
         return ESP_FAIL;
@@ -517,10 +545,13 @@ static esp_err_t upload_recording_to_stt(uint8_t *recording_data, size_t recordi
         uploaded += wlen;
         
         // 打印上传进度
-        if (uploaded % (chunk_size * 10) == 0) {
+        if (uploaded % (chunk_size * 10) == 0 || uploaded == recording_size) {
             ESP_LOGI(TAG, "Uploaded %d/%d bytes (%.1f%%)", 
                     uploaded, recording_size, (float)uploaded * 100 / recording_size);
         }
+        
+        // 添加看门狗喂狗
+        vTaskDelay(pdMS_TO_TICKS(1));
     }
     
     // 发送multipart footer
@@ -563,6 +594,22 @@ static esp_err_t upload_recording_to_stt(uint8_t *recording_data, size_t recordi
                                 ESP_LOGI(TAG, "📝 Transcribed: \"%s\"", text_start);
                             }
                         }
+                        
+                        // 解析返回的device_id（用于验证）
+                        char *device_start = strstr(response, "\"device_id\":\"");
+                        if (device_start) {
+                            device_start += 13;
+                            char *device_end = strchr(device_start, '"');
+                            if (device_end) {
+                                char returned_device[64];
+                                size_t device_len = device_end - device_start;
+                                if (device_len < sizeof(returned_device) - 1) {
+                                    strncpy(returned_device, device_start, device_len);
+                                    returned_device[device_len] = '\0';
+                                    ESP_LOGI(TAG, "✅ Confirmed device_id: %s", returned_device);
+                                }
+                            }
+                        }
                     }
                     free(response);
                 }
@@ -570,26 +617,22 @@ static esp_err_t upload_recording_to_stt(uint8_t *recording_data, size_t recordi
         } else {
             ESP_LOGW(TAG, "❌ STT upload failed with status: %d", status_code);
             
-            // 读取错误信息
-            if (content_length > 0 && content_length < 1024) {
-                char *error_response = malloc(content_length + 1);
-                if (error_response) {
-                    int read_len = esp_http_client_read(client, error_response, content_length);
-                    if (read_len > 0) {
-                        error_response[read_len] = '\0';
-                        ESP_LOGE(TAG, "Error: %s", error_response);
-                    }
-                    free(error_response);
-                }
+            // 尝试读取错误响应
+            char error_buffer[512];
+            int read_len = esp_http_client_read(client, error_buffer, sizeof(error_buffer) - 1);
+            if (read_len > 0) {
+                error_buffer[read_len] = '\0';
+                ESP_LOGE(TAG, "Error response: %s", error_buffer);
             }
             err = ESP_FAIL;
         }
     } else {
-        ESP_LOGE(TAG, "Failed to upload PCM data");
+        ESP_LOGE(TAG, "Upload failed: %s", esp_err_to_name(err));
     }
     
     esp_http_client_close(client);
     esp_http_client_cleanup(client);
+    
     return err;
 }
 
@@ -1064,7 +1107,7 @@ void app_main(void) {
     xTaskCreate(audio_playback_task, "audio_playback", 4096, NULL, 10, NULL);
 
     // 创建麦克风录音任务 - 新增
-    xTaskCreate(microphone_recording_task, "mic_recording", 4096, NULL, 9, NULL);
+    xTaskCreate(microphone_recording_task, "mic_recording", 8192, NULL, 9, NULL);
 
     // 创建TTS轮询任务
     xTaskCreate(tts_polling_task, "tts_polling", 4096, NULL, 5, NULL);
