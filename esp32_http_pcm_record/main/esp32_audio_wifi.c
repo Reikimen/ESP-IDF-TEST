@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <time.h>
 #include <sys/unistd.h>
 #include <sys/stat.h>
 
@@ -47,6 +48,8 @@
 #define TTS_SERVER_IP          "192.168.32.177"
 #define TTS_SERVER_PORT        8001
 #define TTS_SERVER_URL         "http://" TTS_SERVER_IP ":8001"
+#define STT_SERVER_PORT        8000
+#define STT_SERVER_URL         "http://" TTS_SERVER_IP ":8000"
 #define DEVICE_ID              "ESP32_VOICE_01"
 
 /* Audio Hardware Configuration - 保持原有引脚设置 */
@@ -445,9 +448,28 @@ static esp_err_t download_pcm_audio(const char *audio_id) {
 /* 上传录音到STT服务 - 新增函数 */
 static esp_err_t upload_recording_to_stt(uint8_t *recording_data, size_t recording_size) {
     char url[256];
-    snprintf(url, sizeof(url), "%s/stt/%s/upload", TTS_SERVER_URL, DEVICE_ID);
+    snprintf(url, sizeof(url), "%s/upload_pcm", STT_SERVER_URL);
     
-    ESP_LOGI(TAG, "Uploading recording to STT: %d bytes", recording_size);
+    ESP_LOGI(TAG, "Uploading PCM recording to STT: %d bytes", recording_size);
+    ESP_LOGI(TAG, "STT URL: %s", url);
+    
+    // 创建multipart/form-data
+    char boundary[] = "----ESP32FormBoundary";
+    char content_type[128];
+    snprintf(content_type, sizeof(content_type), "multipart/form-data; boundary=%s", boundary);
+    
+    // 构建multipart body
+    char header[512];
+    snprintf(header, sizeof(header),
+        "--%s\r\n"
+        "Content-Disposition: form-data; name=\"file\"; filename=\"esp32_%s_%ld.pcm\"\r\n"
+        "Content-Type: application/octet-stream\r\n\r\n",
+        boundary, DEVICE_ID, (long)time(NULL));
+    
+    char footer[128];
+    snprintf(footer, sizeof(footer), "\r\n--%s--\r\n", boundary);
+    
+    size_t total_size = strlen(header) + recording_size + strlen(footer);
     
     esp_http_client_config_t config = {
         .url = url,
@@ -461,52 +483,109 @@ static esp_err_t upload_recording_to_stt(uint8_t *recording_data, size_t recordi
         return ESP_FAIL;
     }
     
-    // 设置Content-Type为audio/pcm
-    esp_http_client_set_header(client, "Content-Type", "audio/pcm");
+    // 设置headers
+    esp_http_client_set_header(client, "Content-Type", content_type);
     
-    // 打开HTTP连接
-    esp_err_t err = esp_http_client_open(client, recording_size);
+    // 打开连接
+    esp_err_t err = esp_http_client_open(client, total_size);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Failed to open HTTP client: %s", esp_err_to_name(err));
         esp_http_client_cleanup(client);
         return err;
     }
     
-    // 分块上传数据
+    // 发送multipart header
+    int wlen = esp_http_client_write(client, header, strlen(header));
+    if (wlen < 0) {
+        ESP_LOGE(TAG, "Failed to write multipart header");
+        esp_http_client_close(client);
+        esp_http_client_cleanup(client);
+        return ESP_FAIL;
+    }
+    
+    // 发送PCM数据
     size_t uploaded = 0;
     size_t chunk_size = 4096;
-    while (uploaded < recording_size) {
+    while (uploaded < recording_size && err == ESP_OK) {
         size_t to_write = (recording_size - uploaded) > chunk_size ? chunk_size : (recording_size - uploaded);
-        int wlen = esp_http_client_write(client, (char *)(recording_data + uploaded), to_write);
+        wlen = esp_http_client_write(client, (char *)(recording_data + uploaded), to_write);
         if (wlen <= 0) {
-            ESP_LOGE(TAG, "Failed to write data to HTTP client");
+            ESP_LOGE(TAG, "Failed to write PCM data at offset %d", uploaded);
             err = ESP_FAIL;
             break;
         }
         uploaded += wlen;
+        
+        // 打印上传进度
+        if (uploaded % (chunk_size * 10) == 0) {
+            ESP_LOGI(TAG, "Uploaded %d/%d bytes (%.1f%%)", 
+                    uploaded, recording_size, (float)uploaded * 100 / recording_size);
+        }
+    }
+    
+    // 发送multipart footer
+    if (err == ESP_OK) {
+        wlen = esp_http_client_write(client, footer, strlen(footer));
+        if (wlen < 0) {
+            ESP_LOGE(TAG, "Failed to write multipart footer");
+            err = ESP_FAIL;
+        }
     }
     
     if (err == ESP_OK) {
+        ESP_LOGI(TAG, "Upload complete, waiting for response...");
+        
         // 获取响应
         int content_length = esp_http_client_fetch_headers(client);
         int status_code = esp_http_client_get_status_code(client);
         
+        ESP_LOGI(TAG, "STT response - Status: %d, Content-Length: %d", status_code, content_length);
+        
         if (status_code == 200) {
-            ESP_LOGI(TAG, "STT upload successful");
-            // 可以在这里读取响应内容（转换后的文本）
-            if (content_length > 0) {
+            ESP_LOGI(TAG, "✅ STT upload successful");
+            
+            // 读取响应
+            if (content_length > 0 && content_length < 4096) {
                 char *response = malloc(content_length + 1);
                 if (response) {
                     int read_len = esp_http_client_read(client, response, content_length);
-                    response[read_len] = '\0';
-                    ESP_LOGI(TAG, "STT result: %s", response);
+                    if (read_len > 0) {
+                        response[read_len] = '\0';
+                        ESP_LOGI(TAG, "STT response: %s", response);
+                        
+                        // 解析JSON获取转录文本
+                        char *text_start = strstr(response, "\"text\":\"");
+                        if (text_start) {
+                            text_start += 8;
+                            char *text_end = strchr(text_start, '"');
+                            if (text_end) {
+                                *text_end = '\0';
+                                ESP_LOGI(TAG, "📝 Transcribed: \"%s\"", text_start);
+                            }
+                        }
+                    }
                     free(response);
                 }
             }
         } else {
-            ESP_LOGW(TAG, "STT upload failed with status: %d", status_code);
+            ESP_LOGW(TAG, "❌ STT upload failed with status: %d", status_code);
+            
+            // 读取错误信息
+            if (content_length > 0 && content_length < 1024) {
+                char *error_response = malloc(content_length + 1);
+                if (error_response) {
+                    int read_len = esp_http_client_read(client, error_response, content_length);
+                    if (read_len > 0) {
+                        error_response[read_len] = '\0';
+                        ESP_LOGE(TAG, "Error: %s", error_response);
+                    }
+                    free(error_response);
+                }
+            }
             err = ESP_FAIL;
         }
+    } else {
+        ESP_LOGE(TAG, "Failed to upload PCM data");
     }
     
     esp_http_client_close(client);
