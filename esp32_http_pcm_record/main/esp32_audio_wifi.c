@@ -85,9 +85,9 @@
 #define MIC_SAMPLE_RATE        16000        // STT服务通常使用16kHz
 #define MIC_RECORDING_SIZE     (1024 * 1024) // 1MB recording buffer in PSRAM
 #define MIC_CHUNK_SIZE         (1024 * 4)   // 4KB chunks
-#define VOICE_THRESHOLD        500          // 音量阈值
-#define SILENCE_DURATION_MS    3000         // 静音持续时间
-#define MIN_RECORDING_MS       500          // 最小录音时长
+#define VOICE_THRESHOLD        1000          // 音量阈值
+#define SILENCE_DURATION_MS    1500         // 静音持续时间
+#define MIN_RECORDING_MS       2500          // 最小录音时长
 
 static const char *TAG = "ESP32_POLLING_AUDIO";
 static EventGroupHandle_t s_wifi_event_group;
