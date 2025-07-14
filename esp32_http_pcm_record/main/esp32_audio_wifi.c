@@ -37,15 +37,17 @@
 /* WiFi Configuration - 保持不变 */
 // #define WIFI_SSID              "CE-Hub-Student"
 // #define WIFI_PASSWORD          "casa-ce-gagarin-public-service"
-#define WIFI_SSID              "CE-Dankao"
-#define WIFI_PASSWORD          "CELAB2025"
+// #define WIFI_SSID              "CE-Dankao"
+// #define WIFI_PASSWORD          "CELAB2025"
+#define WIFI_SSID              "CE-Wlan-Helper"
+#define WIFI_PASSWORD          "ThanksDankao"
 #define WIFI_CONNECTED_BIT     BIT0
 #define WIFI_FAIL_BIT          BIT1
 #define WIFI_MAXIMUM_RETRY     5
 
 /* HTTP Configuration - 保持不变 */
 // #define TTS_SERVER_IP          "10.129.113.191"
-#define TTS_SERVER_IP          "192.168.32.177"
+#define TTS_SERVER_IP          "192.168.8.198"
 #define TTS_SERVER_PORT        8001
 #define TTS_SERVER_URL         "http://" TTS_SERVER_IP ":8001"
 #define STT_SERVER_PORT        8000
@@ -85,9 +87,9 @@
 #define MIC_SAMPLE_RATE        16000        // STT服务通常使用16kHz
 #define MIC_RECORDING_SIZE     (1024 * 1024) // 1MB recording buffer in PSRAM
 #define MIC_CHUNK_SIZE         (1024 * 4)   // 4KB chunks
-#define VOICE_THRESHOLD        1000          // 音量阈值
+#define VOICE_THRESHOLD        1500          // 音量阈值
 #define SILENCE_DURATION_MS    1500         // 静音持续时间
-#define MIN_RECORDING_MS       2500          // 最小录音时长
+#define MIN_RECORDING_MS       2000          // 最小录音时长
 
 static const char *TAG = "ESP32_POLLING_AUDIO";
 static EventGroupHandle_t s_wifi_event_group;
